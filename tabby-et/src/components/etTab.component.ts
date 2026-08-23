@@ -83,6 +83,10 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
             this.session?.resize(this.size.columns, this.size.rows)
         } catch (e) {
             this.write(colors.black.bgRed(' X ') + ' ' + colors.red(e.message) + '\r\n')
+            // A session that failed mid-start() never set open=true, so the tab's
+            // close path would skip BaseSession.destroy() and leak its timers and
+            // local port listeners. Tear it down here instead.
+            await session.destroy().catch(() => { /* already down */ })
         } finally {
             this.stopSpinner()
         }
@@ -96,9 +100,12 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
     }
 
     showPortForwarding (): void {
+        if (!this.session) {
+            return
+        }
         const modal = this.ngbModal.open(ETPortForwardingModalComponent)
             .componentInstance as ETPortForwardingModalComponent
-        modal.session = this.session!
+        modal.session = this.session
     }
 
     async canClose (): Promise<boolean> {

@@ -1,32 +1,26 @@
 import { Injector } from '@angular/core'
 import * as shellQuote from 'shell-quote'
 import { Observable, ReplaySubject } from 'rxjs'
-import { Logger, LogService, PartialProfile, ProfilesService } from 'tabby-core'
+import { ConfigService, Logger, LogService, PartialProfile, ProfilesService } from 'tabby-core'
 import { SSHProfile, SSHSession } from 'tabby-ssh'
 
 import { ETProfile } from '../api/interfaces'
 import { ET_TERM } from '../protocol/constants'
 import { generateBootstrapId, generateBootstrapPasskey } from '../protocol/crypto'
+import { redactCredentials } from '../redact'
+import { getCaptureLimit } from './captureLimit'
 
 const IDPASSKEY_RE = /IDPASSKEY:([A-Za-z0-9]{16})\/([A-Za-z0-9]{32})/
 const BOOTSTRAP_TIMEOUT = 30000
+
+export { DEFAULT_CAPTURE_BYTES, MIN_CAPTURE_BYTES, MAX_CAPTURE_BYTES, getCaptureLimit } from './captureLimit'
 
 export interface ETCredentials {
     id: string
     passkey: string
 }
 
-/**
- * Strip ET session credentials from any user-visible or logged text.
- * Handles both the `IDPASSKEY:<id>/<passkey>` marker the remote prints and the bare
- * `<id>/<passkey>` pair that appears in the bootstrap command line (16 alphanumerics /
- * 32 alphanumerics). Both forms carry the session passkey and must never reach a log.
- */
-export function redactCredentials (text: string): string {
-    return text
-        .replace(/IDPASSKEY:\S+/g, 'IDPASSKEY:[redacted]')
-        .replace(/[A-Za-z0-9]{16}\/[A-Za-z0-9]{32}/g, '[redacted]/[redacted]')
-}
+export { redactCredentials } from '../redact'
 
 export class ETBootstrap {
     /**
@@ -39,6 +33,7 @@ export class ETBootstrap {
     private sshSessionCreated = new ReplaySubject<SSHSession>(1)
     private logger: Logger
     private profiles: ProfilesService
+    private config: ConfigService
 
     constructor (
         private injector: Injector,
@@ -46,6 +41,7 @@ export class ETBootstrap {
     ) {
         this.logger = injector.get(LogService).create('et-bootstrap')
         this.profiles = injector.get(ProfilesService)
+        this.config = injector.get(ConfigService)
     }
 
     /**
@@ -64,7 +60,7 @@ export class ETBootstrap {
         this.sshSessionCreated.next(session)
         try {
             await session.start()
-            const output = await this.execAndCapture(session, command)
+            const output = await this.execAndCapture(session, command, getCaptureLimit(this.profile.options.bootstrapCaptureLimit))
             const match = IDPASSKEY_RE.exec(output.stdout)
             if (!match) {
                 throw new Error(this.explainMissingMarker(output))
@@ -86,7 +82,11 @@ export class ETBootstrap {
         const id = options?.credentials?.id ?? generateBootstrapId()
         const passkey = options?.credentials?.passkey ?? generateBootstrapPasskey()
 
-        const binary = this.profile.options.etterminalPath ?? 'etterminal'
+        // Per-profile path wins, then the global default from Settings (which
+        // would otherwise be dead config), then the remote PATH.
+        const binary = this.profile.options.etterminalPath
+            ?? this.config.store.et.defaultEtterminalPath
+            ?? 'etterminal'
         const args = [`--verbose=${this.profile.options.verbose}`]
         if (this.profile.options.serverFifo) {
             args.push(`--serverfifo=${this.profile.options.serverFifo}`)
@@ -101,12 +101,16 @@ export class ETBootstrap {
         let command = `echo '${line}' | ${quoted}`
 
         if (this.profile.options.killOtherSessions) {
-            command = `pkill etterminal -u ${shellQuote.quote([user])}; sleep 0.5; ${command}`
+            // user can legitimately be empty ("ask every time") - pkill -u with a
+            // null username would kill nothing but looks confusing in logs.
+            if (user) {
+                command = `pkill etterminal -u ${shellQuote.quote([user])}; sleep 0.5; ${command}`
+            }
         }
         return command
     }
 
-    private execAndCapture (session: SSHSession, command: string): Promise<{ stdout: string, stderr: string }> {
+    private execAndCapture (session: SSHSession, command: string, captureLimit: number): Promise<{ stdout: string, stderr: string }> {
         return new Promise((resolve, reject) => {
             let stdout = ''
             let stderr = ''
@@ -137,7 +141,9 @@ export class ETBootstrap {
                 try {
                     const channel = await session.openExecChannel(command)
                     channel.data$.subscribe(data => {
-                        stdout += Buffer.from(data).toString('utf8')
+                        if (stdout.length < captureLimit) {
+                            stdout += Buffer.from(data).toString('utf8')
+                        }
                         // Resolve as soon as the marker appears - etterminal daemonises and
                         // the channel may stay open briefly afterwards.
                         if (IDPASSKEY_RE.test(stdout)) {
@@ -145,7 +151,9 @@ export class ETBootstrap {
                         }
                     })
                     channel.extendedData$.subscribe(([, data]) => {
-                        stderr += Buffer.from(data).toString('utf8')
+                        if (stderr.length < captureLimit) {
+                            stderr += Buffer.from(data).toString('utf8')
+                        }
                     })
                     channel.closed$.subscribe(() => finish())
                     channel.eof$.subscribe(() => finish())

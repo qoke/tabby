@@ -8,7 +8,7 @@ import { Socket } from 'net'
  */
 export class ByteReader {
     private buffer: Buffer = Buffer.alloc(0)
-    private waiter: { size: number, resolve: (b: Buffer) => void, reject: (e: Error) => void }|null = null
+    private waiter: { size: number, timer: any, resolve: (b: Buffer) => void, reject: (e: Error) => void }|null = null
     private failure: Error|null = null
 
     constructor (socket: Socket) {
@@ -26,6 +26,7 @@ export class ByteReader {
     private pump (): void {
         if (this.waiter && this.buffer.length >= this.waiter.size) {
             const { size, resolve } = this.waiter
+            this.clearTimer()
             this.waiter = null
             const out = this.buffer.subarray(0, size)
             this.buffer = this.buffer.subarray(size)
@@ -40,7 +41,18 @@ export class ByteReader {
         this.failure = err
         const w = this.waiter
         this.waiter = null
+        // The timer must die with the waiter, or it keeps the event loop (and a
+        // doomed reject closure) alive for its full duration.
+        if (w?.timer) {
+            clearTimeout(w.timer)
+        }
         w?.reject(err)
+    }
+
+    private clearTimer (): void {
+        if (this.waiter?.timer) {
+            clearTimeout(this.waiter.timer)
+        }
     }
 
     /** Read exactly `size` bytes. Rejects on socket failure or timeout. */
@@ -60,24 +72,24 @@ export class ByteReader {
             return Promise.reject(new Error('ByteReader: concurrent reads are not supported'))
         }
         return new Promise<Buffer>((resolve, reject) => {
-            let timer: any = null
             this.waiter = {
                 size,
+                timer: null,
                 resolve: b => {
-                    if (timer) {
-                        clearTimeout(timer)
-                    }
+                    this.clearTimer()
                     resolve(b)
                 },
                 reject: e => {
-                    if (timer) {
-                        clearTimeout(timer)
-                    }
+                    this.clearTimer()
                     reject(e)
                 },
             }
             if (timeoutMs) {
-                timer = setTimeout(() => {
+                // A timed-out read does not consume the buffer: the bytes (if any
+                // ever arrive) stay available to a later read, and the timeout
+                // does not tear the socket down. Callers decide what a timeout
+                // means for the connection.
+                this.waiter.timer = setTimeout(() => {
                     const w = this.waiter
                     this.waiter = null
                     w?.reject(new Error(`Timed out waiting for ${size} bytes from the ET server`))

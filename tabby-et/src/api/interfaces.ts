@@ -27,6 +27,13 @@ export interface ETProfileOptions extends LoginScriptsOptions {
     killOtherSessions: boolean
     /** etterminal --verbose level, 0-9. */
     verbose: number
+    /**
+     * Bytes of remote stdout/stderr kept while waiting for the IDPASSKEY marker
+     * during the SSH bootstrap. Null = the 64 KiB default. The cap exists so a
+     * chatty shell cannot grow renderer memory for the whole bootstrap timeout;
+     * the effective value is clamped to [1 KiB, 16 MiB] (§8.3).
+     */
+    bootstrapCaptureLimit: number|null
 
     // --- session behaviour ---
     /** Keepalive probe interval in SECONDS. ET clamps this to 1-5. */

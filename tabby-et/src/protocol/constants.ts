@@ -50,6 +50,8 @@ export const HANDSHAKE_TIMEOUT = 30000
 export const INITIAL_RESPONSE_TIMEOUT = 10000
 export const RECONNECT_INTERVAL = 1000
 export const PING_TIMEOUT = 5000
+/** TCP connect timeout for the initial connection and every reconnect attempt. */
+export const CONNECT_TIMEOUT = 10000
 
 /**
  * etterminal splits the bootstrap line on '_', so TERM must not contain one.

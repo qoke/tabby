@@ -20,9 +20,9 @@ h5(translate) Add a port forward
     .input-group-text &rarr;
     input.form-control(
         type='text',
-        [disabled]='newForward.type === PortForwardType.Local',
+        [disabled]='true',
         [(ngModel)]='newForward.targetAddress',
-        [ngbTooltip]='"ET always connects to the server\'s own localhost for forward tunnels"|translate'
+        [ngbTooltip]='"ET always connects to the destination side\'s own localhost; the target host is ignored"|translate'
     )
     .input-group-text :
     input.form-control(type='number', [(ngModel)]='newForward.targetPort')

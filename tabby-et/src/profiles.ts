@@ -4,6 +4,7 @@ import { NewTabParameters, PartialProfile, QuickConnectProfileProvider, Translat
 import { ETProfile } from './api/interfaces'
 import { ETProfileSettingsComponent } from './components/etProfileSettings.component'
 import { ETTabComponent } from './components/etTab.component'
+import { parseQuickConnectQuery } from './quickConnect'
 import { DEFAULT_ET_PORT } from './protocol/constants'
 
 @Injectable({ providedIn: 'root' })
@@ -22,6 +23,7 @@ export class ETProfilesService extends QuickConnectProfileProvider<ETProfile> {
             serverFifo: null,
             killOtherSessions: false,
             verbose: 0,
+            bootstrapCaptureLimit: null,
             keepaliveInterval: 5,
             maxReconnectAttempts: 0,
             forwardedPorts: [],
@@ -74,27 +76,11 @@ export class ETProfilesService extends QuickConnectProfileProvider<ETProfile> {
      * leading "et " or "et://" so users can paste a command line.
      */
     quickConnect (query: string): PartialProfile<ETProfile> {
-        let raw = query.trim().replace(/^et:\/\//, '').replace(/^et\s+/, '')
-        let user: string|undefined = undefined
-        let port = DEFAULT_ET_PORT
-
-        if (raw.includes('@')) {
-            const parts = raw.split(/@/g)
-            raw = parts[parts.length - 1]
-            user = parts.slice(0, parts.length - 1).join('@')
-        }
-        if (raw.includes('[')) {
-            port = parseInt(raw.split(']')[1].substring(1))
-            raw = raw.split(']')[0].substring(1)
-        } else if (raw.includes(':')) {
-            port = parseInt(raw.split(/:/g)[1])
-            raw = raw.split(':')[0]
-        }
-
+        const target = parseQuickConnectQuery(query)
         return {
             name: query,
             type: 'et',
-            options: { host: raw, user, port },
+            options: { host: target.host, user: target.user, port: target.port },
         }
     }
 

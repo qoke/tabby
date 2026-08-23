@@ -31,6 +31,14 @@ export class ETPortForwardingModalComponent {
     }
 
     onForwardRemoved (fw: ForwardedPortConfig): void {
+        if (fw.type === PortForwardType.Remote) {
+            // The server binds reverse tunnels at INITIAL_PAYLOAD time and there is
+            // no packet to tear one down, so removal can only edit the profile.
+            this.session.emitServiceMessage(
+                'Remote forwards can only be removed before connecting. Remove it from the profile and reconnect.',
+            )
+            return
+        }
         this.session.forwards.removeForward(fw)
         const index = this.model.indexOf(fw)
         if (index >= 0) {

@@ -102,32 +102,54 @@ export class ProtoWriter {
 
 export interface DecodedField {
     wireType: number
-    varint?: number
+    varint?: number|bigint
     bytes?: Buffer
 }
 
 export type DecodedMessage = Map<number, DecodedField[]>
 
-function readVarint (buf: Buffer, offset: number): [number, number] {
-    let result = 0
-    let scale = 1
+/**
+ * Decode a varint exactly.
+ *
+ * Values that fit Number's safe range take the fast path. Larger values are only
+ * ever legitimate for sign-extended negative int32s (10-byte varints); those are
+ * returned as exact BigInts rather than precision-losing floats. More than 10
+ * bytes, or a value wider than 64 bits, is malformed input and is rejected.
+ */
+function readVarint (buf: Buffer, offset: number): [number|bigint, number] {
+    const digits: number[] = []
     let len = 0
     for (;;) {
         if (offset + len >= buf.length) {
             throw new Error('Truncated protobuf varint')
         }
         const byte = buf[offset + len]
-        result += (byte & 0x7f) * scale
+        digits.push(byte & 0x7f)
         len++
         if (!(byte & 0x80)) {
             break
         }
-        scale *= 128
-        if (len > 10) {
+        if (len >= 10) {
             throw new Error('Protobuf varint too long')
         }
     }
-    return [result, len]
+    let result = 0
+    let scale = 1
+    for (const d of digits) {
+        result += d * scale
+        scale *= 128
+    }
+    if (result <= Number.MAX_SAFE_INTEGER) {
+        return [result, len]
+    }
+    let big = BigInt(0)
+    for (let i = digits.length - 1; i >= 0; i--) {
+        big = big << BigInt(7) | BigInt(digits[i])
+    }
+    if (big > BigInt('0xffffffffffffffff')) {
+        throw new Error('Protobuf varint too long')
+    }
+    return [big, len]
 }
 
 /**
@@ -146,8 +168,10 @@ export function decodeFields (buf: Buffer): DecodedMessage {
     }
     let offset = 0
     while (offset < buf.length) {
-        const [tag, tagLen] = readVarint(buf, offset)
+        const [tagValue, tagLen] = readVarint(buf, offset)
         offset += tagLen
+        // Tags are at most 5 bytes, so they always fit a safe number.
+        const tag = Number(tagValue)
         const field = Math.floor(tag / 8)
         const wireType = tag % 8
         if (wireType === WIRE_VARINT) {
@@ -155,18 +179,27 @@ export function decodeFields (buf: Buffer): DecodedMessage {
             offset += len
             add(field, { wireType, varint: value })
         } else if (wireType === WIRE_LEN) {
-            const [len, lenLen] = readVarint(buf, offset)
+            const [lenValue, lenLen] = readVarint(buf, offset)
             offset += lenLen
+            // Lengths we care about are int32; a wider (or bigint) length cannot
+            // be a real field length and would over-run the buffer.
+            const len = Number(lenValue)
             if (offset + len > buf.length) {
                 throw new Error('Truncated protobuf length-delimited field')
             }
             add(field, { wireType, bytes: buf.subarray(offset, offset + len) })
             offset += len
         } else if (wireType === WIRE_FIXED64) {
+            if (offset + 8 > buf.length) {
+                throw new Error('Truncated protobuf fixed64 field')
+            }
             add(field, { wireType, bytes: buf.subarray(offset, offset + 8) })
             offset += 8
         } else if (wireType === WIRE_FIXED32) {
             add(field, { wireType, bytes: buf.subarray(offset, offset + 4) })
+            if (offset + 4 > buf.length) {
+                throw new Error('Truncated protobuf fixed32 field')
+            }
             offset += 4
         } else {
             throw new Error(`Unsupported protobuf wire type ${wireType}`)
@@ -179,14 +212,24 @@ export function has (m: DecodedMessage, field: number): boolean {
     return m.has(field)
 }
 
-export function getVarint (m: DecodedMessage, field: number): number|undefined {
+export function getVarint (m: DecodedMessage, field: number): number|bigint|undefined {
     return m.get(field)?.[0]?.varint
 }
 
-/** ET never sends negative values in the int32 fields we read, but be explicit. */
+/**
+ * Read an int32 field. Handles sign-extended negative values exactly: on the wire
+ * proto2 encodes -1 as a 10-byte varint of 2^64-1, which the fast decoder returns
+ * as a BigInt.
+ */
 export function getInt32 (m: DecodedMessage, field: number): number|undefined {
     const v = getVarint(m, field)
-    return v === undefined ? undefined : v | 0
+    if (v === undefined) {
+        return undefined
+    }
+    if (typeof v === 'bigint') {
+        return Number(BigInt.asIntN(32, v))
+    }
+    return v | 0
 }
 
 export function getBool (m: DecodedMessage, field: number): boolean|undefined {

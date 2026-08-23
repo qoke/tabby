@@ -3,7 +3,7 @@ import colors from 'ansi-colors'
 import { Socket } from 'net'
 import { Observable, ReplaySubject, Subject } from 'rxjs'
 import stripAnsi from 'strip-ansi'
-import { LogService } from 'tabby-core'
+import { ConfigService, LogService } from 'tabby-core'
 import { BaseSession, InputProcessor, UTF8SplitterMiddleware } from 'tabby-terminal'
 import { KeyboardInteractivePrompt, SSHSession } from 'tabby-ssh'
 
@@ -40,6 +40,7 @@ export class ETSession extends BaseSession {
     private awaitingKeepalive = false
     private lastSize = { columns: 0, rows: 0 }
     private initialResponse: { resolve: () => void, reject: (e: Error) => void }|null = null
+    private droppedInputSinceReconnect = false
 
     constructor (
         private injector: Injector,
@@ -61,10 +62,15 @@ export class ETSession extends BaseSession {
 
     async start (): Promise<void> {
         const o = this.profile.options
-        const port = o.port
+
+        // 3 (computed early). With an ET-native jump host the destination may not
+        // accept direct TCP at all, so we probe whatever we will actually connect to.
+        const target = o.jumpHost
+            ? { host: o.jumpHost, port: o.jumpPort }
+            : { host: o.host, port: o.port }
 
         // 1. Fail fast if etserver is unreachable, exactly as `et` does.
-        await this.ping(o.host, port)
+        await this.ping(target.host, target.port)
 
         // 2. Bootstrap over SSH.
         this.emitServiceMessage(colors.bgBlue.black(' SSH ') + ' Starting the remote session')
@@ -82,14 +88,9 @@ export class ETSession extends BaseSession {
             this.emitServiceMessage(colors.bgBlue.black(' JUMP ') + ` Preparing ${o.jumpHost}`)
             credentials = await this.bootstrap.run({
                 credentials,
-                jumpTo: { host: o.host, port },
+                jumpTo: { host: o.host, port: o.port },
             })
         }
-
-        // 3. Connect and authenticate.
-        const target = o.jumpHost
-            ? { host: o.jumpHost, port: o.jumpPort }
-            : { host: o.host, port }
 
         this.connection = new ETClientConnection({
             host: target.host,
@@ -97,6 +98,11 @@ export class ETSession extends BaseSession {
             id: credentials.id,
             passkey: credentials.passkey,
             maxReconnectAttempts: o.maxReconnectAttempts,
+            // debugProtocol logs metadata only (header/length/sequence number);
+            // payload bytes contain keystrokes and must never reach the log.
+            debug: this.injector.get(ConfigService).store.et.debugProtocol
+                ? line => this.logger.info(`[et-proto] ${line}`)
+                : undefined,
         }, this.logger)
 
         this.connection.packet$.subscribe(p => this.handlePacket(p.header, p.payload))
@@ -151,11 +157,25 @@ export class ETSession extends BaseSession {
         })
 
         const promise = new Promise<void>((resolve, reject) => {
-            this.initialResponse = { resolve, reject }
-            setTimeout(
-                () => this.initialResponse?.reject(new Error('The ET server did not acknowledge the session')),
-                INITIAL_RESPONSE_TIMEOUT,
-            )
+            const timer = setTimeout(() => {
+                this.initialResponse = null
+                reject(new Error('The ET server did not acknowledge the session'))
+            }, INITIAL_RESPONSE_TIMEOUT)
+            // The settle callbacks own the timer: a late INITIAL_RESPONSE after
+            // timeout must not reject an already-failed start(), and the timer
+            // must not outlive the wait.
+            this.initialResponse = {
+                resolve: () => {
+                    clearTimeout(timer)
+                    this.initialResponse = null
+                    resolve()
+                },
+                reject: err => {
+                    clearTimeout(timer)
+                    this.initialResponse = null
+                    reject(err)
+                },
+            }
         })
         this.connection!.writePacket(ETPacketType.INITIAL_PAYLOAD, payload)
         return promise
@@ -164,38 +184,45 @@ export class ETSession extends BaseSession {
     // ---- packet routing ---------------------------------------------------
 
     private handlePacket (header: number, payload: Buffer): void {
-        switch (header) {
-            case ETPacketType.TERMINAL_BUFFER:
-                this.emitOutput(decodeTerminalBuffer(payload))
-                this.resetKeepalive()
-                break
+        // ET resets its keepalive timer on ANY inbound traffic.
+        this.resetKeepalive()
+        try {
+            switch (header) {
+                case ETPacketType.TERMINAL_BUFFER:
+                    this.emitOutput(decodeTerminalBuffer(payload))
+                    break
 
-            case ETPacketType.KEEP_ALIVE:
-                this.awaitingKeepalive = false
-                break
+                case ETPacketType.KEEP_ALIVE:
+                    break
 
-            case ETPacketType.INITIAL_RESPONSE: {
-                const response = decodeInitialResponse(payload)
-                const pending = this.initialResponse
-                this.initialResponse = null
-                if (response.hasError) {
-                    pending?.reject(new Error(`The ET server refused the session: ${response.error}`))
-                } else {
-                    pending?.resolve()
+                case ETPacketType.INITIAL_RESPONSE: {
+                    const response = decodeInitialResponse(payload)
+                    const pending = this.initialResponse
+                    if (response.hasError) {
+                        pending?.reject(new Error(`The ET server refused the session: ${response.error}`))
+                    } else {
+                        pending?.resolve()
+                    }
+                    break
                 }
-                break
+
+                case ETPacketType.PORT_FORWARD_DESTINATION_REQUEST:
+                case ETPacketType.PORT_FORWARD_DESTINATION_RESPONSE:
+                case ETPacketType.PORT_FORWARD_DATA:
+                    this.forwards.handlePacket(header, payload)
+                    break
+
+                default:
+                    // Do NOT throw: an unknown header must not kill the session.
+                    this.logger.warn(`Ignoring unknown ET packet type ${header}`)
             }
-
-            case ETPacketType.PORT_FORWARD_DESTINATION_REQUEST:
-            case ETPacketType.PORT_FORWARD_DESTINATION_RESPONSE:
-            case ETPacketType.PORT_FORWARD_DATA:
-                this.forwards.handlePacket(header, payload)
-                this.resetKeepalive()
-                break
-
-            default:
-                // Do NOT throw: an unknown header must not kill the session.
-                this.logger.warn(`Ignoring unknown ET packet type ${header}`)
+        } catch (err) {
+            // A malformed packet (or a decoding bug) must not tear the session
+            // down: it would be read as a socket failure and put us into the
+            // reconnect loop, and a hostile peer could keep us there forever.
+            // Drop the packet and carry on; a real desync still fails at the
+            // Poly1305 check inside BackedReader.read, which DOES reconnect.
+            this.logger.warn(`Dropping malformed ET packet (header ${header}): ${err}`)
         }
     }
 
@@ -208,6 +235,12 @@ export class ETSession extends BaseSession {
             )
         }
         if (state === 'connected' && this.open) {
+            if (this.droppedInputSinceReconnect) {
+                this.droppedInputSinceReconnect = false
+                this.emitServiceMessage(
+                    colors.bgYellow.black(' ~ ') + ' Some input was dropped while the connection was down',
+                )
+            }
             this.emitServiceMessage(colors.bgGreen.black(' OK ') + ' Session resumed')
             // The remote PTY size may have been changed by another client.
             this.sendTerminalInfo(true)
@@ -223,7 +256,9 @@ export class ETSession extends BaseSession {
         // Chunk to match ET's own 16 KiB reads.
         for (let offset = 0; offset < data.length; offset += TERMINAL_CHUNK_SIZE) {
             const chunk = data.subarray(offset, offset + TERMINAL_CHUNK_SIZE)
-            this.connection.writePacket(ETPacketType.TERMINAL_BUFFER, encodeTerminalBuffer(chunk))
+            if (!this.connection.writePacket(ETPacketType.TERMINAL_BUFFER, encodeTerminalBuffer(chunk))) {
+                this.droppedInputSinceReconnect = true
+            }
         }
         this.resetKeepalive()
     }
@@ -254,6 +289,9 @@ export class ETSession extends BaseSession {
     kill (_signal?: string): void {
         // ET has no "kill the remote shell" packet. Closing the socket only detaches;
         // the remote session survives until its shell exits. See ETERNAL_TERMINAL.md D9.
+        // BaseSession.destroy() remains the lifecycle owner (it emits closed$/destroyed$);
+        // kill() only tears the transport down and must be safe to call from anywhere.
+        this.stopKeepalive()
         this.connection?.shutdown()
     }
 
@@ -262,9 +300,14 @@ export class ETSession extends BaseSession {
         this.forwards.dispose()
         this.connection?.shutdown()
         this.connection = null
+        // Reject a pending INITIAL_RESPONSE wait so a start() that is still in
+        // flight cannot outlive the session.
+        this.initialResponse?.reject(new Error('Session destroyed'))
+        this.initialResponse = null
         this.serviceMessage.complete()
         this.kiPrompt.complete()
         this.connectionStateSubject.complete()
+        this.bootstrapSession.complete()
         await super.destroy()
     }
 

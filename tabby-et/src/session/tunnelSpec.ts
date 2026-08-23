@@ -1,12 +1,26 @@
 import { ForwardedPortConfig, PortForwardType } from 'tabby-ssh'
 
+/** A spec expanding to an absurd number of forwards is more likely a typo (or a paste accident) than intent. */
+const MAX_RANGE_PORTS = 1024
+
+function parsePort (s: string): number {
+    const port = parseInt(s, 10)
+    if (isNaN(port) || port < 1 || port > 65535) {
+        throw new Error(`Invalid port "${s}"`)
+    }
+    return port
+}
+
 function parseRange (s: string): number[] {
     if (!s.includes('-')) {
-        return [parseInt(s)]
+        return [parsePort(s)]
     }
-    const [from, to] = s.split('-').map(x => parseInt(x))
-    if (isNaN(from) || isNaN(to) || to < from) {
+    const [from, to] = s.split('-').map(x => parsePort(x))
+    if (to < from) {
         throw new Error(`Invalid port range "${s}"`)
+    }
+    if (to - from + 1 > MAX_RANGE_PORTS) {
+        throw new Error(`Port range "${s}" is too large (maximum ${MAX_RANGE_PORTS} ports)`)
     }
     const out: number[] = []
     for (let p = from; p <= to; p++) {
@@ -19,9 +33,6 @@ function make (
     type: PortForwardType, host: string, port: number,
     targetAddress: string, targetPort: number, description: string,
 ): ForwardedPortConfig {
-    if (isNaN(port) || isNaN(targetPort)) {
-        throw new Error(`Invalid port in "${description}"`)
-    }
     return { type, host, port, targetAddress, targetPort, description }
 }
 
@@ -37,7 +48,7 @@ export function parseTunnelSpec (spec: string, type: PortForwardType): Forwarded
         const parts = element.split(':')
 
         if (parts.length === 4) {
-            out.push(make(type, parts[0], parseInt(parts[1]), parts[2], parseInt(parts[3]), element))
+            out.push(make(type, parts[0], parsePort(parts[1]), parts[2], parsePort(parts[3]), element))
             continue
         }
         if (parts.length !== 2) {
@@ -56,7 +67,7 @@ export function parseTunnelSpec (spec: string, type: PortForwardType): Forwarded
             }
             continue
         }
-        out.push(make(type, '127.0.0.1', parseInt(left), 'localhost', parseInt(right), element))
+        out.push(make(type, '127.0.0.1', parsePort(left), 'localhost', parsePort(right), element))
     }
     return out
 }

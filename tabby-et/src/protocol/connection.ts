@@ -8,7 +8,7 @@ import { BackedWriter } from './backedWriter'
 import { ByteReader } from './byteReader'
 import { ETCrypto } from './crypto'
 import {
-    CLIENT_SERVER_NONCE_MSB, ETConnectStatus, HANDSHAKE_TIMEOUT,
+    CLIENT_SERVER_NONCE_MSB, CONNECT_TIMEOUT, ETConnectStatus, HANDSHAKE_TIMEOUT,
     MAX_HANDSHAKE_PROTO_LENGTH, MAX_PROTO_LENGTH, PROTOCOL_VERSION,
     RECONNECT_INTERVAL, SERVER_CLIENT_NONCE_MSB,
 } from './constants'
@@ -26,6 +26,12 @@ export interface ETConnectionOptions {
     passkey: string
     /** 0 = retry forever, matching the reference client. */
     maxReconnectAttempts: number
+    /**
+     * Receives one line per packet (direction, header, byte count, sequence
+     * number) when debugProtocol is on. MUST only ever receive metadata -
+     * payload bytes contain keystrokes and would leak passwords into logs.
+     */
+    debug?: (line: string) => void
 }
 
 export class ETClientConnection {
@@ -60,28 +66,64 @@ export class ETClientConnection {
     /** Initial connection. Throws on a fatal handshake failure. */
     async connect (): Promise<void> {
         this.setState('connecting')
-        const socket = await this.openSocket()
-        const byteReader = new ByteReader(socket)
-        const status = await this.sendConnectRequest(socket, byteReader)
+        let socket: Socket|null = null
+        let byteReader: ByteReader|null = null
+        try {
+            socket = await this.openSocket()
+            byteReader = new ByteReader(socket)
+            const status = await this.sendConnectRequest(socket, byteReader)
 
-        if (status !== ETConnectStatus.NEW_CLIENT && status !== ETConnectStatus.RETURNING_CLIENT) {
-            socket.destroy()
-            throw new Error(this.describeStatus(status))
+            if (status === ETConnectStatus.NEW_CLIENT) {
+                this.attach(socket, byteReader)
+                socket = null
+                byteReader = null
+            } else if (status === ETConnectStatus.RETURNING_CLIENT) {
+                // A live session for our id still exists on the server (e.g. the
+                // protocol harness re-run, or a recovered tab racing a teardown).
+                // Run the recovery exchange; a fresh process cannot serve the
+                // replay range the server will request, so this fails loudly
+                // instead of desynchronising the nonce counters.
+                try {
+                    await this.recover(socket, byteReader)
+                } catch (err) {
+                    throw new Error(
+                        'The ET server still holds a session for these credentials, but it cannot be resumed '
+                        + 'from a new process. Enable "kill other sessions" in the profile, or terminate the '
+                        + `orphaned etterminal on the remote host. Underlying error: ${err}`,
+                    )
+                }
+                this.attach(socket, byteReader)
+                socket = null
+                byteReader = null
+            } else {
+                throw new Error(this.describeStatus(status))
+            }
+            this.setState('connected')
+            this.runReadLoop()
+        } catch (err) {
+            // Nothing after openSocket() may leak the socket: a handshake read
+            // timeout or a malformed frame must destroy it, or a server that
+            // accepts TCP but stalls leaks one socket per attempt.
+            socket?.destroy()
+            byteReader?.dispose()
+            throw err
         }
-
-        this.attach(socket, byteReader)
-        this.setState('connected')
-        this.runReadLoop()
     }
 
-    /** Send an encrypted packet. Buffers while disconnected. */
-    writePacket (header: number, payload: Buffer): void {
+    /**
+     * Send an encrypted packet. Buffers while disconnected.
+     * Returns false if the packet had to be dropped (disconnect buffer full).
+     */
+    writePacket (header: number, payload: Buffer): boolean {
         if (this.shuttingDown) {
-            return
+            return true
         }
-        if (!this.writer.write(header, payload)) {
+        const written = this.writer.write(header, payload)
+        if (!written) {
             this.logger.warn('ET write buffer is full; dropping a packet')
         }
+        this.options.debug?.(`-> header=${header} bytes=${payload.length} seq=${this.writer.sequenceNumber}${written ? '' : ' DROPPED'}`)
+        return written
     }
 
     /** Deliberately drop the TCP connection to exercise recovery. */
@@ -95,6 +137,8 @@ export class ETClientConnection {
         this.socket?.destroy()
         this.socket = null
         this.byteReader?.dispose()
+        this.byteReader = null
+        this.writer.detach()
         this.setState('ended')
         this.endedSubject.complete()
         this.packetSubject.complete()
@@ -112,6 +156,7 @@ export class ETClientConnection {
     }
 
     private attach (socket: Socket, byteReader: ByteReader): void {
+        this.byteReader?.dispose()
         this.socket = socket
         this.byteReader = byteReader
         this.writer.attach(socket)
@@ -123,13 +168,27 @@ export class ETClientConnection {
         return new Promise((resolve, reject) => {
             const socket = new Socket()
             socket.setNoDelay(true)
-            const onError = (err: Error) => {
+            let settled = false
+            const fail = (err: Error) => {
+                if (settled) {
+                    return
+                }
+                settled = true
                 socket.destroy()
                 reject(err)
             }
-            socket.once('error', onError)
+            const timer = setTimeout(
+                () => fail(new Error(`Timed out connecting to ${this.options.host}:${this.options.port}`)),
+                CONNECT_TIMEOUT,
+            )
+            socket.once('error', fail)
             socket.connect(this.options.port, this.options.host, () => {
-                socket.removeListener('error', onError)
+                if (settled) {
+                    return
+                }
+                settled = true
+                clearTimeout(timer)
+                socket.removeListener('error', fail)
                 resolve(socket)
             })
         })
@@ -179,6 +238,7 @@ export class ETClientConnection {
         try {
             for (;;) {
                 const packet = await this.reader.read()
+                this.options.debug?.(`<- header=${packet.header} bytes=${packet.payload.length} seq=${this.reader.sequenceNumber}`)
                 this.packetSubject.next(packet)
             }
         } catch (err) {
@@ -214,29 +274,38 @@ export class ETClientConnection {
                 return
             }
             this.reconnectAttempts++
+            let socket: Socket|null = null
+            let byteReader: ByteReader|null = null
             try {
-                const socket = await this.openSocket()
-                const byteReader = new ByteReader(socket)
+                socket = await this.openSocket()
+                byteReader = new ByteReader(socket)
                 const status = await this.sendConnectRequest(socket, byteReader)
 
                 if (status === ETConnectStatus.INVALID_KEY) {
                     // The only way the client learns the remote shell has exited.
                     socket.destroy()
+                    socket = null
+                    byteReader = null
                     this.end('Session terminated by the server')
                     return
                 }
                 if (status !== ETConnectStatus.RETURNING_CLIENT) {
                     this.logger.warn(`Unexpected reconnect status ${status}; retrying`)
-                    socket.destroy()
                     continue
                 }
 
                 await this.recover(socket, byteReader)
                 this.attach(socket, byteReader)
+                socket = null
+                byteReader = null
                 this.setState('connected')
                 this.runReadLoop()
                 return
             } catch (err) {
+                // Every failed attempt must release its socket and ByteReader,
+                // or a host that accepts TCP but stalls leaks one per attempt.
+                socket?.destroy()
+                byteReader?.dispose()
                 this.logger.debug(`ET reconnect attempt ${this.reconnectAttempts} failed: ${err}`)
                 if (this.options.maxReconnectAttempts > 0 && this.reconnectAttempts >= this.options.maxReconnectAttempts) {
                     this.end(`Could not resume the session after ${this.reconnectAttempts} attempts`)
@@ -250,6 +319,8 @@ export class ETClientConnection {
      * Symmetric catch-up exchange. Order matters and must be:
      *   write SequenceHeader -> read SequenceHeader -> write CatchupBuffer -> read CatchupBuffer
      * Both peers write before reading, so this cannot deadlock.
+     * Every read carries HANDSHAKE_TIMEOUT (via readProto), so a server that
+     * stalls mid-recovery rejects instead of wedging us in 'reconnecting'.
      */
     private async recover (socket: Socket, byteReader: ByteReader): Promise<void> {
         await this.writeProto(socket, encodeSequenceHeader(this.reader.sequenceNumber))
@@ -271,6 +342,11 @@ export class ETClientConnection {
 
     private end (reason: string): void {
         this.shuttingDown = true
+        this.socket?.destroy()
+        this.socket = null
+        this.byteReader?.dispose()
+        this.byteReader = null
+        this.writer.detach()
         this.setState('ended')
         this.endedSubject.next(reason)
         this.endedSubject.complete()

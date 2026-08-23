@@ -6,7 +6,7 @@ terminal-toolbar([tab]='this')
 
     strong.me-auto(
         style='user-select: text; cursor: text;'
-        onclick='event.stopPropagation()'
+        (click)='$event.stopPropagation()'
     ) {{profile.options.user}}@{{profile.options.host}}:{{profile.options.port}}
 
     span.badge.bg-warning.text-dark.me-2(

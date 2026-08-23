@@ -120,6 +120,17 @@ ul.nav-tabs(ngbNav, #nav='ngbNav')
                     [(ngModel)]='profile.options.verbose',
                 )
 
+            .form-line
+                .header
+                    .title(translate) Bootstrap output cap (bytes)
+                    .description(translate) How much remote stdout/stderr to keep while waiting for the session key. Empty = 64 KiB.
+                input.form-control(
+                    type='number',
+                    min='1024',
+                    max='16777216',
+                    [(ngModel)]='profile.options.bootstrapCaptureLimit',
+                )
+
     li(ngbNavItem)
         a(ngbNavLink, translate) Jump host
         ng-template(ngbNavContent)

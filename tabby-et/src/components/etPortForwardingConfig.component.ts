@@ -34,6 +34,15 @@ export class ETPortForwardingConfigComponent {
     }
 
     addForward (): void {
+        this.specError = null
+        // The inputs are type=number but the browser happily hands us NaN or
+        // out-of-range values; catch them here instead of at net.createServer.
+        for (const [name, port] of [['port', this.newForward.port], ['target port', this.newForward.targetPort]] as const) {
+            if (!Number.isInteger(port) || port < 1 || port > 65535) {
+                this.specError = `Invalid ${name} "${port}". Ports must be between 1 and 65535.`
+                return
+            }
+        }
         this.forwardAdded.emit(this.newForward)
         this.reset()
     }
