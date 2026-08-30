@@ -184,7 +184,13 @@ export class ETBootstrap {
         const port = role === 'jump' ? o.jumpSshPort : o.sshPort
 
         if (linkedId) {
-            const all = await this.profiles.getProfiles()
+            // MUST be cloned: getProfiles() hands back the objects inside
+            // config.store.profiles by reference, and a ConfigProxy setter writes
+            // straight through to them. Overriding host/user on a live profile
+            // would permanently rewrite the user's saved SSH profile - and, since
+            // tabby-ssh looks saved passwords up by profile id, would later offer
+            // that profile's password to a different host.
+            const all = await this.profiles.getProfiles({ clone: true })
             const found = all.find(x => x.id === linkedId && x.type === 'ssh')
             if (!found) {
                 throw new Error(`The linked SSH profile "${linkedId}" no longer exists`)

@@ -7,12 +7,22 @@ export interface ETQuickConnectTarget {
 }
 
 /**
+ * Parse a port, falling back to the ET default for anything that is not a real
+ * TCP port. `parseInt` alone is not enough: it happily yields 0, negatives and
+ * values past 65535, which then fail deep inside net.connect instead of here.
+ */
+function parsePortOrDefault (text: string): number {
+    const parsed = parseInt(text, 10)
+    return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : DEFAULT_ET_PORT
+}
+
+/**
  * Pure parser behind ETProfilesService.quickConnect.
  *
  * Accepts "user@host", "user@host:2022", "user@[::1]:2022", and tolerates a
  * leading "et " or "et://" so users can paste a command line. Never throws and
- * never produces a non-finite port: unparsable port parts fall back to the
- * default, and unbalanced brackets degrade to a best-effort host.
+ * always produces a port in 1-65535: unparsable or out-of-range port parts fall
+ * back to the default, and unbalanced brackets degrade to a best-effort host.
  */
 export function parseQuickConnectQuery (query: string): ETQuickConnectTarget {
     let raw = query.trim().replace(/^et:\/\//, '').replace(/^et\s+/, '')
@@ -29,19 +39,12 @@ export function parseQuickConnectQuery (query: string): ETQuickConnectTarget {
         // missing in malformed input - treat the whole remainder as the host
         // instead of crashing on undefined.
         const after = raw.split(']')
-        const portPart = after.length > 1 ? after[1].substring(1) : ''
-        const parsed = parseInt(portPart, 10)
-        if (!isNaN(parsed)) {
-            port = parsed
-        }
+        port = parsePortOrDefault(after.length > 1 ? after[1].substring(1) : '')
         raw = after[0].substring(1)
     } else if ((raw.match(/:/g) ?? []).length === 1) {
         // Exactly one ':' means host:port. Bare IPv6 hosts (::1) contain
         // multiple colons and never carry a port in this shorthand.
-        const parsed = parseInt(raw.split(':')[1], 10)
-        if (!isNaN(parsed)) {
-            port = parsed
-        }
+        port = parsePortOrDefault(raw.split(':')[1])
         raw = raw.split(':')[0]
     }
 

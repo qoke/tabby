@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/explicit-module-boundary-types */
 import { Component, Input, Output, EventEmitter } from '@angular/core'
 import { ForwardedPortConfig, PortForwardType } from 'tabby-ssh'
-import { parseTunnelSpec } from '../session/tunnelSpec'
+import { isLoopbackBindAddress, parseTunnelSpec } from '../session/tunnelSpec'
 
 /** @hidden */
 @Component({
@@ -20,6 +20,15 @@ export class ETPortForwardingConfigComponent {
 
     constructor () {
         this.reset()
+    }
+
+    /**
+     * A Local forward binding a non-loopback address publishes the tunnel to the
+     * whole network - anyone who can reach this machine gets to use it. Only
+     * Local forwards bind here; a Remote forward's `host` is bound by etserver.
+     */
+    exposesToNetwork (fw: ForwardedPortConfig): boolean {
+        return fw.type === PortForwardType.Local && !isLoopbackBindAddress(fw.host)
     }
 
     reset (): void {

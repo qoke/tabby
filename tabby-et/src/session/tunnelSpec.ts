@@ -3,6 +3,21 @@ import { ForwardedPortConfig, PortForwardType } from 'tabby-ssh'
 /** A spec expanding to an absurd number of forwards is more likely a typo (or a paste accident) than intent. */
 const MAX_RANGE_PORTS = 1024
 
+/**
+ * Does this bind address keep a local listener private to this machine?
+ *
+ * A forward that binds anything else exposes the tunnel - and whatever sits at
+ * the far end of it - to the local network, so §17.4 requires warning about it.
+ * An empty address is NOT loopback: net.Server treats it as "all interfaces".
+ */
+export function isLoopbackBindAddress (host: string): boolean {
+    const h = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '')
+    return h === 'localhost'
+        || h === '::1'
+        || h === '0:0:0:0:0:0:0:1'
+        || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)
+}
+
 function parsePort (s: string): number {
     const port = parseInt(s, 10)
     if (isNaN(port) || port < 1 || port > 65535) {

@@ -7,6 +7,10 @@
                 .ms-3 {{fw.host}}:{{fw.port}}
                 .ms-2 &rarr;
                 .ms-2 {{fw.targetAddress}}:{{fw.targetPort}}
+                i.fas.fa-exclamation-triangle.text-warning.ms-2(
+                    *ngIf='exposesToNetwork(fw)',
+                    [ngbTooltip]='"This forward is reachable from the whole network, not just this computer"|translate'
+                )
             div {{fw.description}}
         button.btn.btn-link.hover-reveal.ms-auto((click)='remove(fw)')
             i.fas.fa-trash-alt
@@ -26,6 +30,9 @@ h5(translate) Add a port forward
     )
     .input-group-text :
     input.form-control(type='number', [(ngModel)]='newForward.targetPort')
+
+.alert.alert-warning.mb-2(*ngIf='exposesToNetwork(newForward)', translate)
+    | This bind address is reachable from the whole network - anyone who can reach this computer will be able to use the forward. Bind 127.0.0.1 to keep it local.
 
 .input-group.mb-2
     input.form-control(

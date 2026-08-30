@@ -53,7 +53,10 @@ export class ETSession extends BaseSession {
 
         this.forwards = new ETPortForwardHandler(
             this.logger,
-            (header, payload) => this.connection?.writePacket(header, payload),
+            // The boolean matters here: a dropped PORT_FORWARD_DATA packet would
+            // silently corrupt a tunnelled byte stream, so the handler needs to
+            // know. No connection at all counts as a drop.
+            (header, payload) => this.connection?.writePacket(header, payload) ?? false,
             msg => this.emitServiceMessage(msg),
         )
     }

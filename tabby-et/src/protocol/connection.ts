@@ -4,7 +4,7 @@ import { Observable, Subject } from 'rxjs'
 import { Logger } from 'tabby-core'
 
 import { BackedReader, ETPacket } from './backedReader'
-import { BackedWriter } from './backedWriter'
+import { BackedWriter, UnrecoverableSessionError } from './backedWriter'
 import { ByteReader } from './byteReader'
 import { ETCrypto } from './crypto'
 import {
@@ -307,6 +307,13 @@ export class ETClientConnection {
                 socket?.destroy()
                 byteReader?.dispose()
                 this.logger.debug(`ET reconnect attempt ${this.reconnectAttempts} failed: ${err}`)
+                if (err instanceof UnrecoverableSessionError) {
+                    // Retrying cannot fix this - the replay range is gone for
+                    // good, so every further attempt would fail identically and
+                    // leave the tab wedged on "reconnecting" forever.
+                    this.end(`The session cannot be resumed: ${err.message}`)
+                    return
+                }
                 if (this.options.maxReconnectAttempts > 0 && this.reconnectAttempts >= this.options.maxReconnectAttempts) {
                     this.end(`Could not resume the session after ${this.reconnectAttempts} attempts`)
                     return

@@ -2,6 +2,13 @@ import { Socket } from 'net'
 import { ETCrypto, MAC_BYTES } from './crypto'
 import { DISCONNECT_BUFFER_BYTES, MAX_BACKUP_BYTES, PACKET_HEADER_SIZE } from './constants'
 
+/**
+ * A recovery failure that retrying cannot fix: the replay range the peer asked
+ * for is gone (or never existed), so every future reconnect would fail the same
+ * way. The connection layer ends the session on this instead of looping forever.
+ */
+export class UnrecoverableSessionError extends Error {}
+
 /** Serialize a Packet: [encrypted=1][header][ciphertext]. */
 function serializePacket (header: number, encryptedPayload: Buffer): Buffer {
     const out = Buffer.allocUnsafe(PACKET_HEADER_SIZE + encryptedPayload.length)
@@ -79,13 +86,17 @@ export class BackedWriter {
     recover (lastValidSequenceNumber: number): Buffer[] {
         const toRecover = this.sequenceNumber - lastValidSequenceNumber
         if (toRecover < 0) {
-            throw new Error('Invalid recovery sequence: we are behind the server')
+            throw new UnrecoverableSessionError(
+                'the server has received more packets than we ever sent (we are behind the server)',
+            )
         }
         if (toRecover === 0) {
             return []
         }
         if (toRecover > this.backupBuffer.length) {
-            throw new Error('Too far behind the server to resume this session')
+            throw new UnrecoverableSessionError(
+                'the packets the server is missing have already been trimmed from the replay buffer',
+            )
         }
         return this.backupBuffer.slice(0, toRecover).reverse()
     }

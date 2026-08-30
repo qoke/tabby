@@ -11,7 +11,24 @@ import {
     encodePortForwardDestinationRequest, encodePortForwardDestinationResponse,
 } from '../protocol/messages'
 
-type Send = (header: number, payload: Buffer) => void
+/** Returns false when the packet had to be dropped (the ET write buffer is full). */
+type Send = (header: number, payload: Buffer) => boolean
+
+/**
+ * Which side of a tunnel we are for a given socket. The two roles have
+ * INDEPENDENT socketId namespaces - ours are allocated by `nextSocketId`, the
+ * peer's by the peer (upstream uses rand()) - so ids collide routinely and every
+ * lookup, insert and delete has to name its role.
+ */
+type Role = 'source'|'destination'
+
+/**
+ * Ceiling on sockets a peer can make us open at once. Every one of these is an
+ * inbound PORT_FORWARD_DESTINATION_REQUEST, i.e. peer-driven: without a cap a
+ * compromised etserver could exhaust our file descriptors through a single
+ * declared reverse tunnel.
+ */
+const MAX_CONCURRENT_DESTINATION_SOCKETS = 256
 
 interface SourceListener {
     config: ForwardedPortConfig
@@ -28,10 +45,12 @@ function describe (c: ForwardedPortConfig): string {
 }
 
 function resolveAgentPath (): string|null {
-    if (process.platform === 'win32') {
-        return '\\\\.\\pipe\\openssh-ssh-agent'
-    }
-    return process.env.SSH_AUTH_SOCK ?? null
+    // An explicitly configured agent wins everywhere - including on Windows,
+    // where Pageant/gpg-agent shims set SSH_AUTH_SOCK too. Only fall back to the
+    // stock OpenSSH pipe, which may or may not have an agent behind it; if it
+    // does not, the connect attempt fails and we answer with a destination error.
+    return process.env.SSH_AUTH_SOCK
+        ?? (process.platform === 'win32' ? '\\\\.\\pipe\\openssh-ssh-agent' : null)
 }
 
 export class ETPortForwardHandler {
@@ -51,6 +70,8 @@ export class ETPortForwardHandler {
      * to pivot us at arbitrary local or intranet ports (see §17.4).
      */
     private declaredReverseDestinations: { name?: string, port?: number }[] = []
+    /** Destination sockets that are connecting but not yet in destinationSockets. */
+    private pendingDestinations = 0
     private nextToken = 1
     private nextSocketId = 1
 
@@ -75,9 +96,23 @@ export class ETPortForwardHandler {
     addLocalForward (config: ForwardedPortConfig): Promise<void> {
         return new Promise((resolve, reject) => {
             const server = createServer(socket => this.onLocalConnection(config, socket))
-            server.once('error', reject)
+            const onListenError = (err: Error) => reject(err)
+            server.once('error', onListenError)
             server.listen(config.port, config.host, () => {
-                server.removeListener('error', reject)
+                server.removeListener('error', onListenError)
+                // A net.Server with no 'error' listener THROWS on any later error
+                // (EMFILE while accepting, for one), which would take the whole
+                // renderer down. Keep one attached for the listener's lifetime,
+                // and report only the first - the rest are noise from the teardown.
+                let reported = false
+                server.on('error', err => {
+                    if (reported) {
+                        return
+                    }
+                    reported = true
+                    this.emitServiceMessage(`Port forward ${describe(config)} failed: ${err.message}`)
+                    this.removeForward(config)
+                })
                 this.listeners.push({ config, server })
                 this.emitServiceMessage(`Forwarding ${describe(config)}`)
                 resolve()
@@ -191,12 +226,15 @@ export class ETPortForwardHandler {
         const previous = this.sourceSockets.get(socketId)
         if (previous) {
             // socketIds are allocated by the peer (upstream uses rand()), so treat
-            // a collision as "the peer considers the old one dead".
+            // a collision as "the peer considers the old one dead". Destroy it
+            // BEFORE registering the replacement: destroy() emits 'close'
+            // asynchronously, and forget() is identity-checked precisely so that
+            // late 'close' cannot evict the socket that took its id.
             previous.destroy()
         }
         this.sourceSockets.set(socketId, entry.socket)
         this.sourceSocketConfigs.set(socketId, entry.config)
-        this.pipeSocket(entry.socket, socketId, true)
+        this.pipeSocket(entry.socket, socketId, 'source')
         entry.socket.resume()
     }
 
@@ -212,23 +250,56 @@ export class ETPortForwardHandler {
             return
         }
 
+        if (this.destinationSockets.size + this.pendingDestinations >= MAX_CONCURRENT_DESTINATION_SOCKETS) {
+            this.logger.warn('Refused a port-forward destination: too many concurrent forwarded connections')
+            this.sendDestinationError(request.fd, new Error('Too many concurrent forwarded connections'))
+            return
+        }
+        this.pendingDestinations++
+        // Exactly one of these runs, exactly once, so the pending count is always
+        // released - including on the malformed-destination path below.
+        let settled = false
+        const connected = (socket: Socket) => {
+            if (settled) {
+                socket.destroy()
+                return
+            }
+            settled = true
+            this.pendingDestinations--
+            this.onDestinationConnected(socket, request.fd)
+        }
+        const failed = (err: Error) => {
+            if (settled) {
+                return
+            }
+            settled = true
+            this.pendingDestinations--
+            this.sendDestinationError(request.fd, err)
+        }
+
         if (target.port) {
             // Upstream always connects TCP destinations to the connecting side's
             // own localhost (::1, then 127.0.0.1) and ignores destination.name -
             // including on the client side for reverse tunnels. Mirror that.
-            this.connectLocalhost(target.port, socket => this.onDestinationConnected(socket, request.fd), err =>
-                this.sendDestinationError(request.fd, err))
+            this.connectLocalhost(target.port, connected, failed)
         } else if (target.name) {
             // Unix socket path, or a Windows named pipe for agent forwarding.
             const socket = new Socket()
             socket.setNoDelay(true)
-            socket.once('error', err => {
+            const onConnectError = (err: Error) => {
                 socket.destroy()
-                this.sendDestinationError(request.fd, err)
+                failed(err)
+            }
+            socket.once('error', onConnectError)
+            socket.connect(target.name, () => {
+                // Hand the socket over cleanly: pipeSocket installs its own error
+                // handling, and leaving this one attached would answer a mid-stream
+                // error with a second DESTINATION_RESPONSE for the same fd.
+                socket.removeListener('error', onConnectError)
+                connected(socket)
             })
-            socket.connect(target.name, () => this.onDestinationConnected(socket, request.fd))
         } else {
-            this.sendDestinationError(request.fd, new Error('Malformed port forward destination'))
+            failed(new Error('Malformed port forward destination'))
         }
     }
 
@@ -239,7 +310,7 @@ export class ETPortForwardHandler {
             ETPacketType.PORT_FORWARD_DESTINATION_RESPONSE,
             encodePortForwardDestinationResponse({ clientFd: fd, socketId, hasError: false }),
         )
-        this.pipeSocket(socket, socketId, false)
+        this.pipeSocket(socket, socketId, 'destination')
     }
 
     private sendDestinationError (fd: number, err: Error): void {
@@ -288,14 +359,29 @@ export class ETPortForwardHandler {
 
     // ---- shared plumbing --------------------------------------------------
 
-    private pipeSocket (socket: Socket, socketId: number, sourceToDestination: boolean): void {
+    private pipeSocket (socket: Socket, socketId: number, role: Role): void {
+        // The wire flag is about direction of travel, not about our role: data we
+        // send as the source travels source -> destination.
+        const sourceToDestination = role === 'source'
+
         socket.on('data', (data: Buffer) => {
             for (let o = 0; o < data.length; o += PORT_FORWARD_CHUNK_SIZE) {
-                this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
+                const sent = this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
                     sourceToDestination,
                     socketId,
                     buffer: data.subarray(o, o + PORT_FORWARD_CHUNK_SIZE),
                 }))
+                if (!sent) {
+                    // Unlike terminal input, a forwarded stream is a reliable byte
+                    // stream: silently skipping a packet hands the peer a hole it
+                    // can never detect. Fail the connection instead, so the local
+                    // application sees a reset rather than corrupt data.
+                    this.emitServiceMessage(
+                        'Dropped a forwarded connection: the ET write buffer is full',
+                    )
+                    this.closeForwardedSocket(role, socketId, socket)
+                    return
+                }
             }
         })
         socket.on('end', () => {
@@ -307,18 +393,56 @@ export class ETPortForwardHandler {
             this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
                 sourceToDestination, socketId, error: err.message,
             }))
-            this.forget(socketId)
+            this.forget(role, socketId, socket)
         })
-        socket.on('close', () => this.forget(socketId))
+        socket.on('close', () => this.forget(role, socketId, socket))
     }
 
-    private forget (socketId: number): void {
-        this.sourceSockets.delete(socketId)
-        this.sourceSocketConfigs.delete(socketId)
-        this.destinationSockets.delete(socketId)
+    /** Tear a tunnelled connection down and tell the peer, best effort. */
+    private closeForwardedSocket (role: Role, socketId: number, socket: Socket): void {
+        this.send(ETPacketType.PORT_FORWARD_DATA, encodePortForwardData({
+            sourceToDestination: role === 'source', socketId, closed: true,
+        }))
+        socket.destroy()
+        this.forget(role, socketId, socket)
+    }
+
+    private socketsFor (role: Role): Map<number, Socket> {
+        return role === 'source' ? this.sourceSockets : this.destinationSockets
+    }
+
+    /**
+     * Unregister a socket from ITS OWN role's map only.
+     *
+     * Both the role and the socket identity matter. The two maps are separate id
+     * namespaces, so deleting `socketId` from both would evict an unrelated live
+     * connection that happens to share the number; and a destroyed socket's
+     * 'close' arrives a tick late, so without the identity check it would evict
+     * the replacement that already took its id.
+     */
+    private forget (role: Role, socketId: number, socket: Socket): void {
+        const map = this.socketsFor(role)
+        if (map.get(socketId) !== socket) {
+            return
+        }
+        map.delete(socketId)
+        if (role === 'source') {
+            this.sourceSocketConfigs.delete(socketId)
+        }
     }
 
     handlePacket (header: number, payload: Buffer): void {
+        // A malformed packet must never throw out of here: ETSession treats a
+        // throw as a socket failure and would churn the connection. Drop it and
+        // carry on; a genuine crypto desync still fails inside BackedReader.
+        try {
+            this.handlePacketInner(header, payload)
+        } catch (err) {
+            this.logger.warn(`Dropping malformed port-forward packet (header ${header}): ${err}`)
+        }
+    }
+
+    private handlePacketInner (header: number, payload: Buffer): void {
         if (header === ETPacketType.PORT_FORWARD_DESTINATION_REQUEST) {
             this.onDestinationRequest(payload)
             return
@@ -331,15 +455,15 @@ export class ETPortForwardHandler {
         const data = decodePortForwardData(payload)
         // sourceToDestination=true means "for whoever is the destination", i.e. us when
         // the peer is the source. The two maps keep the roles apart.
-        const map = data.sourceToDestination ? this.destinationSockets : this.sourceSockets
-        const socket = map.get(data.socketId)
+        const role: Role = data.sourceToDestination ? 'destination' : 'source'
+        const socket = this.socketsFor(role).get(data.socketId)
         if (!socket) {
             this.logger.debug(`Data for a closed forwarded socket ${data.socketId}`)
             return
         }
         if (data.closed !== undefined || data.error !== undefined) {
             socket.destroy()
-            this.forget(data.socketId)
+            this.forget(role, data.socketId, socket)
             return
         }
         if (data.buffer?.length) {
@@ -362,5 +486,7 @@ export class ETPortForwardHandler {
         this.sourceSockets.clear()
         this.sourceSocketConfigs.clear()
         this.destinationSockets.clear()
+        this.declaredReverseDestinations = []
+        this.pendingDestinations = 0
     }
 }
