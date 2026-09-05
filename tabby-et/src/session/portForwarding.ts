@@ -30,6 +30,47 @@ type Role = 'source'|'destination'
  */
 const MAX_CONCURRENT_DESTINATION_SOCKETS = 256
 
+/**
+ * How much data may sit queued for one local socket before we give up on it.
+ *
+ * The ET connection is a single multiplexed stream, so we cannot apply
+ * backpressure to the peer without stalling every other tunnel and the terminal
+ * as well. Bound the damage to the one socket that is not keeping up instead.
+ */
+const MAX_LOCAL_WRITE_BACKLOG = 8 * 1024 * 1024
+
+/**
+ * What a destination endpoint actually resolves to.
+ *
+ * `SocketEndpoint` carries both a name and a port, and the two are not mutually
+ * exclusive on the wire. Every decision about an endpoint - both the allow-list
+ * check and the connect that follows it - MUST go through resolveDestination()
+ * so that they cannot disagree about which field wins.
+ */
+type ResolvedDestination =
+    { kind: 'tcp', port: number }
+    | { kind: 'pipe', path: string }
+
+function isValidPort (port: number|undefined): port is number {
+    return port !== undefined && Number.isInteger(port) && port >= 1 && port <= 65535
+}
+
+/**
+ * The single rule for reading a destination endpoint.
+ *
+ * A usable port wins, exactly as upstream's createDestination does; otherwise a
+ * name means a Unix socket or named pipe. Anything else is malformed.
+ */
+function resolveDestination (target: { name?: string, port?: number }): ResolvedDestination|null {
+    if (isValidPort(target.port)) {
+        return { kind: 'tcp', port: target.port }
+    }
+    if (target.name) {
+        return { kind: 'pipe', path: target.name }
+    }
+    return null
+}
+
 interface SourceListener {
     config: ForwardedPortConfig
     server: Server
@@ -69,7 +110,13 @@ export class ETPortForwardHandler {
      * of them is checked against this list: a malicious etserver must not be able
      * to pivot us at arbitrary local or intranet ports (see §17.4).
      */
-    private declaredReverseDestinations: { name?: string, port?: number }[] = []
+    private declaredReverseDestinations: ResolvedDestination[] = []
+    /**
+     * Forwards this SESSION currently has, for the runtime port-forwarding UI.
+     * Stable array identity: mutated in place, never reassigned, so an Angular
+     * template can bind straight to it.
+     */
+    readonly activeForwards: ForwardedPortConfig[] = []
     /** Destination sockets that are connecting but not yet in destinationSockets. */
     private pendingDestinations = 0
     private nextToken = 1
@@ -114,6 +161,7 @@ export class ETPortForwardHandler {
                     this.removeForward(config)
                 })
                 this.listeners.push({ config, server })
+                this.activeForwards.push(config)
                 this.emitServiceMessage(`Forwarding ${describe(config)}`)
                 resolve()
             })
@@ -125,6 +173,7 @@ export class ETPortForwardHandler {
         if (index >= 0) {
             this.listeners[index].server.close()
             this.listeners.splice(index, 1)
+            this.forgetActiveForwards(x => x === config)
             // The forward no longer exists from the user's point of view, so its
             // live tunnelled connections go too.
             for (const [socketId, owned] of this.sourceSocketConfigs) {
@@ -149,13 +198,26 @@ export class ETPortForwardHandler {
     buildReverseTunnelRequests (options: ETProfileOptions): PortForwardSourceRequest[] {
         const requests: PortForwardSourceRequest[] = []
         this.declaredReverseDestinations = []
+        this.forgetActiveForwards(x => x.type === PortForwardType.Remote)
 
         for (const config of options.forwardedPorts.filter(x => x.type === PortForwardType.Remote)) {
+            // A port outside 1-65535 cannot be declared as TCP, and declaring it
+            // anyway would put an entry in the allow-list that no TCP request can
+            // match - leaving the endpoint reachable only through the name branch.
+            // Refuse the whole tunnel instead.
+            if (!isValidPort(config.port) || !isValidPort(config.targetPort)) {
+                this.emitServiceMessage(
+                    `Skipping the reverse tunnel ${config.host}:${config.port} -> localhost:${config.targetPort}: `
+                    + 'both ports must be between 1 and 65535.',
+                )
+                continue
+            }
             requests.push({
                 source: { name: config.host, port: config.port },
                 destination: { name: config.targetAddress, port: config.targetPort },
             })
-            this.declaredReverseDestinations.push({ port: config.targetPort })
+            this.declaredReverseDestinations.push({ kind: 'tcp', port: config.targetPort })
+            this.activeForwards.push(config)
         }
 
         if (options.forwardAgent) {
@@ -171,11 +233,20 @@ export class ETPortForwardHandler {
                     destination: { name: authSock },
                     environmentVariable: 'SSH_AUTH_SOCK',
                 })
-                this.declaredReverseDestinations.push({ name: authSock })
+                this.declaredReverseDestinations.push({ kind: 'pipe', path: authSock })
             }
         }
 
         return requests
+    }
+
+    /** Drop matching entries from activeForwards in place, preserving array identity. */
+    private forgetActiveForwards (predicate: (c: ForwardedPortConfig) => boolean): void {
+        for (let i = this.activeForwards.length - 1; i >= 0; i--) {
+            if (predicate(this.activeForwards[i])) {
+                this.activeForwards.splice(i, 1)
+            }
+        }
     }
 
     // ---- we are the SOURCE ------------------------------------------------
@@ -242,9 +313,19 @@ export class ETPortForwardHandler {
 
     private onDestinationRequest (payload: Buffer): void {
         const request = decodePortForwardDestinationRequest(payload)
-        const target = request.destination
+        // Resolve FIRST, then check the resolved endpoint, then act on that same
+        // resolved endpoint. The check and the connect must never re-read the raw
+        // fields independently: a request naming the declared agent socket AND a
+        // port used to pass the name-based check and then get connected as TCP,
+        // turning any declared reverse tunnel into an arbitrary localhost pivot.
+        const resolved = resolveDestination(request.destination)
 
-        if (!this.isDeclaredReverseDestination(target)) {
+        if (!resolved) {
+            this.sendDestinationError(request.fd, new Error('Malformed port forward destination'))
+            return
+        }
+
+        if (!this.isDeclaredReverseDestination(resolved)) {
             this.logger.warn('Rejected a port-forward destination that was not declared for this session')
             this.sendDestinationError(request.fd, new Error('Destination was not declared for this session'))
             return
@@ -277,12 +358,12 @@ export class ETPortForwardHandler {
             this.sendDestinationError(request.fd, err)
         }
 
-        if (target.port) {
+        if (resolved.kind === 'tcp') {
             // Upstream always connects TCP destinations to the connecting side's
             // own localhost (::1, then 127.0.0.1) and ignores destination.name -
             // including on the client side for reverse tunnels. Mirror that.
-            this.connectLocalhost(target.port, connected, failed)
-        } else if (target.name) {
+            this.connectLocalhost(resolved.port, connected, failed)
+        } else {
             // Unix socket path, or a Windows named pipe for agent forwarding.
             const socket = new Socket()
             socket.setNoDelay(true)
@@ -291,15 +372,13 @@ export class ETPortForwardHandler {
                 failed(err)
             }
             socket.once('error', onConnectError)
-            socket.connect(target.name, () => {
+            socket.connect(resolved.path, () => {
                 // Hand the socket over cleanly: pipeSocket installs its own error
                 // handling, and leaving this one attached would answer a mid-stream
                 // error with a second DESTINATION_RESPONSE for the same fd.
                 socket.removeListener('error', onConnectError)
                 connected(socket)
             })
-        } else {
-            failed(new Error('Malformed port forward destination'))
         }
     }
 
@@ -344,16 +423,20 @@ export class ETPortForwardHandler {
     }
 
     /**
-     * A destination request is only honoured when it names something we declared
-     * in INITIAL_PAYLOAD. TCP destinations are matched on port (the name is not
-     * authoritative for TCP, and older servers may not echo it); Unix-socket
-     * destinations such as agent forwarding are matched on the path.
+     * A destination request is only honoured when it matches something we declared
+     * in INITIAL_PAYLOAD, compared as the SAME resolved kind.
+     *
+     * Matching kind-for-kind is what closes the bypass: a TCP request can only ever
+     * be satisfied by a TCP entry (matched on port - the name is not authoritative
+     * for TCP and older servers may not echo it), and a pipe request only by a pipe
+     * entry (matched on path). An endpoint carrying both fields can no longer be
+     * validated as one kind and connected as the other.
      */
-    private isDeclaredReverseDestination (target: { name?: string, port?: number }): boolean {
+    private isDeclaredReverseDestination (resolved: ResolvedDestination): boolean {
         return this.declaredReverseDestinations.some(d =>
-            d.port !== undefined
-                ? d.port === target.port
-                : d.name !== undefined && d.name === target.name,
+            d.kind === 'tcp'
+                ? resolved.kind === 'tcp' && d.port === resolved.port
+                : resolved.kind === 'pipe' && d.path === resolved.path,
         )
     }
 
@@ -461,13 +544,35 @@ export class ETPortForwardHandler {
             this.logger.debug(`Data for a closed forwarded socket ${data.socketId}`)
             return
         }
-        if (data.closed !== undefined || data.error !== undefined) {
+        if (data.error !== undefined) {
+            // The far side failed mid-stream. Whatever is still queued locally is
+            // part of a stream we know to be broken, so dropping it is correct.
             socket.destroy()
             this.forget(role, data.socketId, socket)
             return
         }
+        if (data.closed !== undefined) {
+            // Clean EOF. destroy() would discard the socket's writable buffer and
+            // silently truncate the transfer whenever the local reader is slower
+            // than the tunnel - a short file with no error anywhere. end() flushes
+            // what is queued, then closes.
+            this.forget(role, data.socketId, socket)
+            socket.end()
+            return
+        }
         if (data.buffer?.length) {
             socket.write(data.buffer)
+            if (socket.writableLength > MAX_LOCAL_WRITE_BACKLOG) {
+                // We cannot push back on the peer: one multiplexed stream carries
+                // every tunnel and the terminal, so pausing it would stall all of
+                // them. An authenticated-but-hostile server could otherwise grow
+                // the renderer's heap without bound through a declared tunnel
+                // whose local endpoint accepts but never reads.
+                this.emitServiceMessage(
+                    'Closed a forwarded connection: the local endpoint is not reading fast enough',
+                )
+                this.closeForwardedSocket(role, data.socketId, socket)
+            }
         }
     }
 
@@ -487,6 +592,7 @@ export class ETPortForwardHandler {
         this.sourceSocketConfigs.clear()
         this.destinationSockets.clear()
         this.declaredReverseDestinations = []
+        this.activeForwards.length = 0
         this.pendingDestinations = 0
     }
 }

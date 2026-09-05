@@ -10,8 +10,19 @@ import { ETSession } from '../session/etSession'
 export class ETPortForwardingModalComponent {
     @Input() session: ETSession
 
+    /**
+     * The forwards this SESSION has right now - NOT the profile's saved list.
+     *
+     * `session.profile` is a ConfigProxy over the object inside config.store, so
+     * pushing to its forwardedPorts wrote straight through to the user's saved
+     * profile and was persisted on the next config.save(): a forward added "just
+     * for this session" became permanent, and one removed for this session
+     * vanished from the profile. tabby-ssh's equivalent modal keeps runtime
+     * forwards on the session for exactly this reason; the saved list is edited
+     * in profile settings, which binds the same component to the profile.
+     */
     get model (): ForwardedPortConfig[] {
-        return this.session.profile.options.forwardedPorts
+        return this.session.forwards.activeForwards
     }
 
     async onForwardAdded (fw: ForwardedPortConfig): Promise<void> {
@@ -23,8 +34,9 @@ export class ETPortForwardingModalComponent {
             return
         }
         try {
+            // addLocalForward registers it in activeForwards on success, so a
+            // forward that fails to bind never appears in the list.
             await this.session.forwards.addLocalForward(fw)
-            this.model.push(fw)
         } catch (e) {
             this.session.emitServiceMessage(`Could not forward port: ${e.message}`)
         }
@@ -40,9 +52,5 @@ export class ETPortForwardingModalComponent {
             return
         }
         this.session.forwards.removeForward(fw)
-        const index = this.model.indexOf(fw)
-        if (index >= 0) {
-            this.model.splice(index, 1)
-        }
     }
 }

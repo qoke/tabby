@@ -170,8 +170,13 @@ export function decodeFields (buf: Buffer): DecodedMessage {
     while (offset < buf.length) {
         const [tagValue, tagLen] = readVarint(buf, offset)
         offset += tagLen
-        // Tags are at most 5 bytes, so they always fit a safe number.
-        const tag = Number(tagValue)
+        // Tags are 32-bit on the wire (29-bit field number + 3-bit wire type).
+        // Anything wider is malformed, and converting it to Number would lose
+        // the wire-type bits to float precision.
+        if (typeof tagValue === 'bigint' || tagValue > 0xFFFFFFFF) {
+            throw new Error('Malformed protobuf tag')
+        }
+        const tag = tagValue
         const field = Math.floor(tag / 8)
         const wireType = tag % 8
         if (wireType === WIRE_VARINT) {
@@ -181,9 +186,11 @@ export function decodeFields (buf: Buffer): DecodedMessage {
         } else if (wireType === WIRE_LEN) {
             const [lenValue, lenLen] = readVarint(buf, offset)
             offset += lenLen
-            // Lengths we care about are int32; a wider (or bigint) length cannot
-            // be a real field length and would over-run the buffer.
-            const len = Number(lenValue)
+            // Field lengths are int32 on the wire; wider values are malformed.
+            if (typeof lenValue === 'bigint') {
+                throw new Error('Malformed protobuf field length')
+            }
+            const len = lenValue
             if (offset + len > buf.length) {
                 throw new Error('Truncated protobuf length-delimited field')
             }

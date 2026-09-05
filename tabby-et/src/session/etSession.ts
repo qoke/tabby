@@ -38,6 +38,8 @@ export class ETSession extends BaseSession {
     private bootstrap: ETBootstrap|null = null
     private keepaliveTimer: any = null
     private awaitingKeepalive = false
+    /** When we last saw INBOUND traffic. Outbound writes deliberately do not count. */
+    private lastInboundAt = 0
     private lastSize = { columns: 0, rows: 0 }
     private initialResponse: { resolve: () => void, reject: (e: Error) => void }|null = null
     private droppedInputSinceReconnect = false
@@ -188,7 +190,7 @@ export class ETSession extends BaseSession {
 
     private handlePacket (header: number, payload: Buffer): void {
         // ET resets its keepalive timer on ANY inbound traffic.
-        this.resetKeepalive()
+        this.noteInboundTraffic()
         try {
             switch (header) {
                 case ETPacketType.TERMINAL_BUFFER:
@@ -245,6 +247,9 @@ export class ETSession extends BaseSession {
                 )
             }
             this.emitServiceMessage(colors.bgGreen.black(' OK ') + ' Session resumed')
+            // A completed handshake is inbound proof of life, so the probe clock
+            // starts fresh rather than firing immediately after every resume.
+            this.noteInboundTraffic()
             // The remote PTY size may have been changed by another client.
             this.sendTerminalInfo(true)
         }
@@ -263,7 +268,8 @@ export class ETSession extends BaseSession {
                 this.droppedInputSinceReconnect = true
             }
         }
-        this.resetKeepalive()
+        // NOTE: deliberately does NOT touch the keepalive. Sending bytes is no
+        // evidence the link is alive; see noteInboundTraffic().
     }
 
     resize (columns: number, rows: number): void {
@@ -337,15 +343,33 @@ export class ETSession extends BaseSession {
 
     // ---- keepalive --------------------------------------------------------
 
+    /** Effective probe interval in ms. ET clamps this to 1-5 seconds. */
+    private get keepaliveIntervalMs (): number {
+        const configured = this.profile.options.keepaliveInterval
+        // A hand-edited config file can hold a string or null here. Math.max(NaN, 1)
+        // is NaN, and setInterval(fn, NaN) fires every millisecond - which would
+        // turn the probe below into a reconnect storm.
+        const seconds = typeof configured === 'number' && Number.isFinite(configured) ? configured : 5
+        return Math.min(Math.max(seconds, 1), 5) * 1000
+    }
+
     private startKeepalive (): void {
-        const interval = Math.min(Math.max(this.profile.options.keepaliveInterval, 1), 5) * 1000
+        const interval = this.keepaliveIntervalMs
         this.stopKeepalive()
+        this.noteInboundTraffic()
         this.keepaliveTimer = setInterval(() => {
             if (!this.connection || this.connection.state !== 'connected') {
                 this.awaitingKeepalive = false
                 return
             }
+            if (Date.now() - this.lastInboundAt < interval) {
+                // Traffic is arriving, so the link is demonstrably alive. ET resets
+                // its keepalive timer on inbound traffic; there is nothing to probe.
+                this.awaitingKeepalive = false
+                return
+            }
             if (this.awaitingKeepalive) {
+                // A probe went out a full interval ago and NOTHING has come back.
                 this.logger.info('Missed a keepalive; forcing a reconnect')
                 this.awaitingKeepalive = false
                 this.connection.forceReconnect()
@@ -356,8 +380,19 @@ export class ETSession extends BaseSession {
         }, interval)
     }
 
-    private resetKeepalive (): void {
+    /**
+     * Record proof that the link is alive. INBOUND traffic only.
+     *
+     * Outbound writes must never clear `awaitingKeepalive`: they say nothing about
+     * whether the peer is still there. Resetting on every keystroke meant a user
+     * typing into a black-holed connection cleared the outstanding probe before
+     * the next tick could notice it had gone unanswered, so the dead link was
+     * never detected and the session never resumed - the exact failure ET exists
+     * to prevent.
+     */
+    private noteInboundTraffic (): void {
         this.awaitingKeepalive = false
+        this.lastInboundAt = Date.now()
     }
 
     private stopKeepalive (): void {

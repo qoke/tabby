@@ -30,7 +30,16 @@ function parseRange (s: string): number[] {
     if (!s.includes('-')) {
         return [parsePort(s)]
     }
-    const [from, to] = s.split('-').map(x => parsePort(x))
+    const [fromStr, toStr] = s.split('-')
+    let from = NaN
+    let to = NaN
+    try {
+        from = parsePort(fromStr)
+        to = parsePort(toStr)
+    } catch {
+        // Report the whole range token: "Invalid port \"\"" for "-5" helps nobody.
+        throw new Error(`Invalid port range "${s}"`)
+    }
     if (to < from) {
         throw new Error(`Invalid port range "${s}"`)
     }

@@ -4,9 +4,10 @@ import { Observable, Subject } from 'rxjs'
 import { Logger } from 'tabby-core'
 
 import { BackedReader, ETPacket } from './backedReader'
-import { BackedWriter, UnrecoverableSessionError } from './backedWriter'
+import { BackedWriter } from './backedWriter'
 import { ByteReader } from './byteReader'
 import { ETCrypto } from './crypto'
+import { UnrecoverableSessionError } from './errors'
 import {
     CLIENT_SERVER_NONCE_MSB, CONNECT_TIMEOUT, ETConnectStatus, HANDSHAKE_TIMEOUT,
     MAX_HANDSHAKE_PROTO_LENGTH, MAX_PROTO_LENGTH, PROTOCOL_VERSION,
@@ -52,6 +53,11 @@ export class ETClientConnection {
     private writer: BackedWriter
     private shuttingDown = false
     private reconnectAttempts = 0
+    /**
+     * True while connect() owns a socket that is not yet reachable through
+     * `this.socket`. Nothing may start a competing handshake during that window.
+     */
+    private handshakeInFlight = false
 
     constructor (
         private options: ETConnectionOptions,
@@ -66,6 +72,7 @@ export class ETClientConnection {
     /** Initial connection. Throws on a fatal handshake failure. */
     async connect (): Promise<void> {
         this.setState('connecting')
+        this.handshakeInFlight = true
         let socket: Socket|null = null
         let byteReader: ByteReader|null = null
         try {
@@ -107,6 +114,11 @@ export class ETClientConnection {
             socket?.destroy()
             byteReader?.dispose()
             throw err
+        } finally {
+            // Cleared only once attach() has published the socket (or the attempt
+            // has failed outright), so the window this guards is exactly the one
+            // where a reconnect could not see what connect() is holding.
+            this.handshakeInFlight = false
         }
     }
 
@@ -245,6 +257,16 @@ export class ETClientConnection {
             if (this.shuttingDown) {
                 return
             }
+            if (err instanceof UnrecoverableSessionError) {
+                // A Poly1305 failure, not a socket failure. Reconnecting cannot
+                // recover the packet and, if the counters are genuinely out of
+                // step, would reconnect-and-fail on every subsequent packet
+                // forever (each success resets reconnectAttempts, so the attempt
+                // cap never trips). Stop, and say why.
+                this.logger.error(`ET stream integrity failure: ${err.message}`)
+                this.end(`The encrypted session stream failed its integrity check: ${err.message}`)
+                return
+            }
             this.logger.info(`ET read loop stopped: ${err}`)
             this.dropSocketAndReconnect()
         }
@@ -252,6 +274,14 @@ export class ETClientConnection {
 
     private dropSocketAndReconnect (): void {
         if (this.shuttingDown || this.state === 'reconnecting') {
+            return
+        }
+        if (this.handshakeInFlight) {
+            // connect() is mid-handshake on a socket we cannot see yet. Starting
+            // a reconnect now would run a SECOND concurrent handshake for the
+            // same session id: both would attach, and the two nonce streams would
+            // diverge immediately. The in-flight handshake has its own timeout.
+            this.logger.info('Ignoring a reconnect request made during the initial handshake')
             return
         }
         this.socket?.destroy()
@@ -276,6 +306,15 @@ export class ETClientConnection {
             this.reconnectAttempts++
             let socket: Socket|null = null
             let byteReader: ByteReader|null = null
+            // EVERY path out of an attempt must release the attempt's socket and
+            // reader, or a server that answers but never resumes leaks one file
+            // descriptor per second, forever.
+            const release = () => {
+                socket?.destroy()
+                byteReader?.dispose()
+                socket = null
+                byteReader = null
+            }
             try {
                 socket = await this.openSocket()
                 byteReader = new ByteReader(socket)
@@ -283,13 +322,27 @@ export class ETClientConnection {
 
                 if (status === ETConnectStatus.INVALID_KEY) {
                     // The only way the client learns the remote shell has exited.
-                    socket.destroy()
-                    socket = null
-                    byteReader = null
+                    release()
                     this.end('Session terminated by the server')
                     return
                 }
+                if (status === ETConnectStatus.MISMATCHED_PROTOCOL) {
+                    // The etserver was upgraded or replaced under us. Permanent.
+                    release()
+                    this.end(this.describeStatus(status))
+                    return
+                }
+                if (status === ETConnectStatus.NEW_CLIENT) {
+                    // The server has no memory of our session, so it just created
+                    // a blank one with no shell behind it. Our sequence numbers
+                    // and nonces are meaningless to it; attaching would desync at
+                    // the first packet. Permanent.
+                    release()
+                    this.end('The ET server no longer has this session. The remote shell has ended or etserver was restarted.')
+                    return
+                }
                 if (status !== ETConnectStatus.RETURNING_CLIENT) {
+                    release()
                     this.logger.warn(`Unexpected reconnect status ${status}; retrying`)
                     continue
                 }
@@ -302,10 +355,7 @@ export class ETClientConnection {
                 this.runReadLoop()
                 return
             } catch (err) {
-                // Every failed attempt must release its socket and ByteReader,
-                // or a host that accepts TCP but stalls leaks one per attempt.
-                socket?.destroy()
-                byteReader?.dispose()
+                release()
                 this.logger.debug(`ET reconnect attempt ${this.reconnectAttempts} failed: ${err}`)
                 if (err instanceof UnrecoverableSessionError) {
                     // Retrying cannot fix this - the replay range is gone for

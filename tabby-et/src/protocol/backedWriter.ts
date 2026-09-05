@@ -1,13 +1,11 @@
 import { Socket } from 'net'
 import { ETCrypto, MAC_BYTES } from './crypto'
 import { DISCONNECT_BUFFER_BYTES, MAX_BACKUP_BYTES, PACKET_HEADER_SIZE } from './constants'
+import { UnrecoverableSessionError } from './errors'
 
-/**
- * A recovery failure that retrying cannot fix: the replay range the peer asked
- * for is gone (or never existed), so every future reconnect would fail the same
- * way. The connection layer ends the session on this instead of looping forever.
- */
-export class UnrecoverableSessionError extends Error {}
+// Re-exported for the existing importers: the type now lives in ./errors so that
+// crypto.ts can raise it too without a cycle (backedWriter already imports crypto).
+export { UnrecoverableSessionError } from './errors'
 
 /** Serialize a Packet: [encrypted=1][header][ciphertext]. */
 function serializePacket (header: number, encryptedPayload: Buffer): Buffer {

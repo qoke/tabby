@@ -1,6 +1,8 @@
 import { randomBytes } from 'crypto'
 import nacl from 'tweetnacl'
 
+import { UnrecoverableSessionError } from './errors'
+
 export const KEY_BYTES = 32
 export const NONCE_BYTES = 24
 export const MAC_BYTES = 16
@@ -45,7 +47,16 @@ export class ETCrypto {
         this.increment()
         const out = nacl.secretbox.open(Uint8Array.from(ciphertext), this.nonce, this.key)
         if (!out) {
-            throw new Error('ET packet failed authentication - wrong passkey or desynchronised nonce')
+            // Deliberately fatal, not a reconnect. Recovery cannot help: this
+            // packet's sequence number is already counted, so the server will
+            // never replay it. Worse, if the counters really have desynchronised
+            // then every later packet fails too, and because a successful
+            // reconnect resets the attempt counter the session would churn
+            // forever. A failed authentication check is also exactly the signal
+            // we must not paper over - see ETERNAL_TERMINAL.md §17.1.
+            throw new UnrecoverableSessionError(
+                'a packet failed its authentication check (wrong passkey, desynchronised nonce, or tampering)',
+            )
         }
         return Buffer.from(out)
     }

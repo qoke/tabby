@@ -19,6 +19,7 @@ export class ByteReader {
     private waiter: { size: number, timer: any, resolve: (b: Buffer) => void, reject: (e: Error) => void }|null = null
     private failure: Error|null = null
     private paused = false
+    private disposed = false
 
     constructor (private socket: Socket) {
         socket.on('data', data => this.onData(data))
@@ -88,6 +89,12 @@ export class ByteReader {
 
     /** Read exactly `size` bytes. Rejects on socket failure or timeout. */
     read (size: number, timeoutMs?: number): Promise<Buffer> {
+        if (this.disposed) {
+            // dispose() is authoritative: no reads after it, even from data that
+            // is still buffered. (A socket FAILURE is different - buffered bytes
+            // were genuinely received and stay readable until drained.)
+            return Promise.reject(this.failure ?? new Error('Reader disposed'))
+        }
         if (size === 0) {
             return Promise.resolve(Buffer.alloc(0))
         }
@@ -134,6 +141,7 @@ export class ByteReader {
     }
 
     dispose (): void {
+        this.disposed = true
         this.fail(new Error('Reader disposed'))
     }
 }
