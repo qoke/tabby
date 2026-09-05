@@ -5,7 +5,7 @@ terminal-toolbar([tab]='this')
     i.fas.fa-xs.fa-circle.text-danger.me-2(*ngIf='connectionState === "ended"')
 
     strong.me-auto(
-        style='user-select: text; cursor: text;'
+        style='user-select: text; cursor: text;',
         (click)='$event.stopPropagation()'
     ) {{profile.options.user}}@{{profile.options.host}}:{{profile.options.port}}
 
