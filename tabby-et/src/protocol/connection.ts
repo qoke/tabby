@@ -58,6 +58,12 @@ export class ETClientConnection {
      * `this.socket`. Nothing may start a competing handshake during that window.
      */
     private handshakeInFlight = false
+    /**
+     * The socket/reader of the handshake currently in flight, if any. They are
+     * NOT reachable through `this.socket` until attach() runs, so shutdown()
+     * needs this reference to tear them down.
+     */
+    private pendingHandshake: { socket: Socket, byteReader: ByteReader }|null = null
 
     constructor (
         private options: ETConnectionOptions,
@@ -71,6 +77,12 @@ export class ETClientConnection {
 
     /** Initial connection. Throws on a fatal handshake failure. */
     async connect (): Promise<void> {
+        if (this.shuttingDown) {
+            throw new Error('Cannot connect: the session has already ended')
+        }
+        if (this.handshakeInFlight) {
+            throw new Error('Cannot connect twice: a handshake is already in flight')
+        }
         this.setState('connecting')
         this.handshakeInFlight = true
         let socket: Socket|null = null
@@ -78,6 +90,9 @@ export class ETClientConnection {
         try {
             socket = await this.openSocket()
             byteReader = new ByteReader(socket)
+            // Published so shutdown() can reach the socket while the handshake is
+            // still in flight - it is NOT reachable through this.socket yet.
+            this.pendingHandshake = { socket, byteReader }
             const status = await this.sendConnectRequest(socket, byteReader)
 
             if (status === ETConnectStatus.NEW_CLIENT) {
@@ -105,6 +120,12 @@ export class ETClientConnection {
             } else {
                 throw new Error(this.describeStatus(status))
             }
+            if (this.shuttingDown) { // eslint-disable-line @typescript-eslint/no-unnecessary-condition -- TS cannot see shutdown() reassign it across the await
+                // shutdown() raced the handshake. Attaching now would leave a live
+                // socket and a 'connected' state on a session the user already
+                // tore down; fail instead (the catch below destroys the socket).
+                throw new Error('Connection shut down during the handshake')
+            }
             this.setState('connected')
             this.runReadLoop()
         } catch (err) {
@@ -119,6 +140,7 @@ export class ETClientConnection {
             // has failed outright), so the window this guards is exactly the one
             // where a reconnect could not see what connect() is holding.
             this.handshakeInFlight = false
+            this.pendingHandshake = null
         }
     }
 
@@ -146,6 +168,11 @@ export class ETClientConnection {
 
     shutdown (): void {
         this.shuttingDown = true
+        // A handshake in flight owns a socket that shutdown() cannot see through
+        // this.socket - kill it explicitly, or it lingers until CONNECT_TIMEOUT.
+        this.pendingHandshake?.socket.destroy()
+        this.pendingHandshake?.byteReader.dispose()
+        this.pendingHandshake = null
         this.socket?.destroy()
         this.socket = null
         this.byteReader?.dispose()
@@ -308,16 +335,19 @@ export class ETClientConnection {
             let byteReader: ByteReader|null = null
             // EVERY path out of an attempt must release the attempt's socket and
             // reader, or a server that answers but never resumes leaks one file
-            // descriptor per second, forever.
+            // descriptor per second, forever. Registering them as the pending
+            // handshake also lets shutdown() reach them mid-attempt.
             const release = () => {
                 socket?.destroy()
                 byteReader?.dispose()
                 socket = null
                 byteReader = null
+                this.pendingHandshake = null
             }
             try {
                 socket = await this.openSocket()
                 byteReader = new ByteReader(socket)
+                this.pendingHandshake = { socket, byteReader }
                 const status = await this.sendConnectRequest(socket, byteReader)
 
                 if (status === ETConnectStatus.INVALID_KEY) {

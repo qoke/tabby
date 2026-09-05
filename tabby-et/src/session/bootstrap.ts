@@ -51,7 +51,7 @@ export class ETBootstrap {
      */
     async run (options?: { credentials?: ETCredentials, jumpTo?: { host: string, port: number } }): Promise<ETCredentials> {
         const sshProfile = await this.resolveSSHProfile(options?.jumpTo ? 'jump' : 'destination')
-        const command = this.buildCommand(sshProfile.options.user, options)
+        const command = this.buildCommand(sshProfile.options.user ?? '', options)
 
         // Redact: on the jump-host path the command embeds the real id/passkey.
         this.logger.debug(`Bootstrap command: ${redactCredentials(command)}`)
