@@ -235,8 +235,11 @@ export class ETSession extends BaseSession {
         this.connectionState = state
         this.connectionStateSubject.next(state)
         if (state === 'reconnecting') {
+            // Logged only: the tab shows a sticky toast from connectionState$
+            // so this must not also land in the terminal or as a second toast.
             this.emitServiceMessage(
                 colors.bgYellow.black(' ~ ') + ' Connection lost, attempting to resume the session...',
+                { notify: false },
             )
         }
         if (state === 'connected' && this.open) {
@@ -246,7 +249,7 @@ export class ETSession extends BaseSession {
                     colors.bgYellow.black(' ~ ') + ' Some input was dropped while the connection was down',
                 )
             }
-            this.emitServiceMessage(colors.bgGreen.black(' OK ') + ' Session resumed')
+            this.emitServiceMessage(colors.bgGreen.black(' OK ') + ' Session resumed', { notify: false })
             // A completed handshake is inbound proof of life, so the probe clock
             // starts fresh rather than firing immediately after every resume.
             this.noteInboundTraffic()
@@ -336,8 +339,10 @@ export class ETSession extends BaseSession {
         return []
     }
 
-    emitServiceMessage (msg: string): void {
-        this.serviceMessage.next(msg)
+    emitServiceMessage (msg: string, options?: { notify?: boolean }): void {
+        if (options?.notify !== false) {
+            this.serviceMessage.next(msg)
+        }
         this.logger.info(stripAnsi(msg))
     }
 

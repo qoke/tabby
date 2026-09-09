@@ -12,7 +12,7 @@ terminal-toolbar([tab]='this')
     span.badge.bg-warning.text-dark.me-2(
         *ngIf='connectionState === "reconnecting"',
         translate
-    ) Resuming...
+    ) Disconnected — resuming…
 
     button.btn.btn-sm.btn-link.me-2((click)='reconnect()')
         i.fas.fa-redo
@@ -24,6 +24,10 @@ terminal-toolbar([tab]='this')
     )
         i.fas.fa-plug
         span(translate) Ports
+
+.et-disconnect-banner(*ngIf='connectionState === "reconnecting"')
+    i.fas.fa-exclamation-triangle.me-2
+    strong(translate) Connection lost, attempting to resume the session...
 
 keyboard-interactive-auth-panel.bg-dark(
     *ngIf='activeKIPrompt && bootstrapProfile',

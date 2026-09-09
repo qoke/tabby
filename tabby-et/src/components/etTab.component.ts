@@ -1,8 +1,8 @@
 import { marker as _ } from '@biesbjerg/ngx-translate-extract-marker'
-import colors from 'ansi-colors'
 import { Component, HostListener, Injector } from '@angular/core'
 import { NgbModal } from '@ng-bootstrap/ng-bootstrap'
-import { Platform } from 'tabby-core'
+import stripAnsi from 'strip-ansi'
+import { Platform, StickyNotification } from 'tabby-core'
 import { BaseTerminalTabComponent, ConnectableTerminalTabComponent } from 'tabby-terminal'
 import { KeyboardInteractivePrompt, SSHProfile } from 'tabby-ssh'
 
@@ -25,6 +25,8 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
     activeKIPrompt: KeyboardInteractivePrompt|null = null
     /** The synthesised SSH profile, needed by the keyboard-interactive panel. */
     bootstrapProfile: SSHProfile|null = null
+
+    private disconnectToast: StickyNotification|null = null
 
     constructor (
         injector: Injector,
@@ -61,11 +63,10 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
         this.setSession(session)
 
         this.attachSessionHandler(session.serviceMessage$, msg => {
-            const formatted = msg.replace(/\n/g, '\r\n      ')
-            this.write(`\r${colors.black.bgWhite(' ET ')} ${formatted}\r\n`)
+            this.showServiceToast(msg)
         })
         this.attachSessionHandler(session.connectionState$, state => {
-            this.connectionState = state
+            this.onETConnectionState(state)
         })
         this.attachSessionHandler(session.keyboardInteractivePrompt$, prompt => {
             this.activeKIPrompt = prompt
@@ -82,7 +83,7 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
             await session.start()
             this.session?.resize(this.size.columns, this.size.rows)
         } catch (e) {
-            this.write(colors.black.bgRed(' X ') + ' ' + colors.red(e.message) + '\r\n')
+            this.notifications.error(e.message, this.etNotificationTitle)
             // A session that failed mid-start() never set open=true, so the tab's
             // close path would skip BaseSession.destroy() and leak its timers and
             // local port listeners. Tear it down here instead.
@@ -93,10 +94,74 @@ export class ETTabComponent extends ConnectableTerminalTabComponent<ETProfile> {
     }
 
     protected onSessionDestroyed (): void {
+        this.dismissDisconnectToast()
         if (this.frontend) {
-            this.write('\r\n' + colors.black.bgWhite(' ET ') + ` ${this.profile.options.host}: session closed\r\n`)
+            this.notifications.info(
+                this.translate.instant(_('{host}: session closed'), { host: this.profile.options.host }),
+                this.etNotificationTitle,
+            )
             super.onSessionDestroyed()
         }
+    }
+
+    ngOnDestroy (): void {
+        this.dismissDisconnectToast()
+        super.ngOnDestroy()
+    }
+
+    private onETConnectionState (state: ETConnectionState): void {
+        const wasDisconnected = this.disconnectToast !== null
+        this.connectionState = state
+        if (state === 'reconnecting') {
+            this.ensureDisconnectToast()
+            return
+        }
+        this.dismissDisconnectToast()
+        if (state === 'connected' && wasDisconnected) {
+            this.notifications.success(
+                this.translate.instant(_('Session resumed')),
+                this.etNotificationTitle,
+            )
+        }
+    }
+
+    private ensureDisconnectToast (): void {
+        if (this.disconnectToast) {
+            return
+        }
+        this.disconnectToast = this.notifications.stickyWarning(
+            `${this.etNotificationTitle} — ${this.translate.instant(_('Connection lost, attempting to resume the session...'))}`,
+            this.translate.instant(_('Disconnected')),
+        )
+    }
+
+    private dismissDisconnectToast (): void {
+        this.disconnectToast?.dismiss()
+        this.disconnectToast = null
+    }
+
+    private showServiceToast (msg: string): void {
+        const text = stripAnsi(msg).replace(/\s+/g, ' ').trim()
+        if (!text) {
+            return
+        }
+        const title = this.etNotificationTitle
+        if (text.startsWith('X ') || this.isErrorServiceMessage(text)) {
+            this.notifications.error(text, title)
+        } else if (text.startsWith('~ ') || /dropped/i.test(text)) {
+            this.notifications.warning(text, title)
+        } else {
+            this.notifications.info(text, title)
+        }
+    }
+
+    private isErrorServiceMessage (text: string): boolean {
+        return /fail|refus|could not|rejected|terminated|too far|mismatch|error/i.test(text)
+    }
+
+    private get etNotificationTitle (): string {
+        const o = this.profile.options
+        return `${o.user}@${o.host}:${o.port}`
     }
 
     showPortForwarding (): void {
