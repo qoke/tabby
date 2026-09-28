@@ -1,0 +1,123 @@
+name: ET SSH support macOS preview
+
+on:
+  push:
+    branches: [tabby-et-ssh-support]
+    paths: ['.github/workflows/et-local-preview.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch upstream release tags
+        run: git fetch --force --tags https://github.com/Eugeny/tabby.git
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Tabby dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libsecret-1-dev
+          npm i -g yarn
+          cd app
+          yarn
+          cd ..
+          rm app/node_modules/.yarn-integrity
+          yarn
+      - run: yarn run build:typings
+      - run: yarn run lint
+
+  macos-arm64:
+    needs: lint
+    runs-on: macos-15
+    env:
+      ARCH: arm64
+      RUST_TARGET_TRIPLE: aarch64-apple-darwin
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch upstream release tags
+        run: git fetch --force --tags https://github.com/Eugeny/tabby.git
+      - run: git rev-parse HEAD > tabby-commit.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: rustup target add aarch64-apple-darwin
+      - run: yarn --network-timeout 1000000
+      - run: yarn run build
+      - run: scripts/prepackage-plugins.mjs
+      - name: Apply upstream ArchiveTarget workaround
+        run: sed -i '' 's/updateInfo = await/\/\/updateInfo = await/g' node_modules/app-builder-lib/out/targets/ArchiveTarget.js
+      - run: ln -s ../../node_modules/electron app/node_modules
+      - name: Configure ad-hoc signing for this local preview
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          script = Path('scripts/build-macos.mjs')
+          content = script.read_text()
+          unsigned = 'identity: !process.env.CI || process.env.CSC_LINK ? undefined : null,'
+          assert content.count(unsigned) == 1, 'Tabby signing configuration changed'
+          script.write_text(content.replace(unsigned, "identity: '-',"))
+
+          entitlements = Path('build/mac/entitlements.plist')
+          content = entitlements.read_text()
+          closing = '  </dict>\n'
+          assert content.count(closing) == 1, 'Tabby entitlements changed'
+          content = content.replace(closing, '    <key>com.apple.security.cs.disable-library-validation</key>\n    <true/>\n' + closing)
+          entitlements.write_text(content)
+          PY
+      - run: scripts/build-macos.mjs
+      - name: Verify and name preview image
+        run: |
+          codesign --verify --deep --strict --verbose=2 dist/mac-arm64/Tabby.app
+          hdiutil verify dist/*.dmg
+          unzip -tq dist/*.zip
+          for archive in dist/*.dmg dist/*.zip; do
+            mv "$archive" "${archive%.*}-et-ssh-support-run-${GITHUB_RUN_ID}.${archive##*.}"
+          done
+          shasum -a 256 dist/*.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tabby-et-ssh-support-macos-arm64-run-${{ github.run_id }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            tabby-commit.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  macos-smoke:
+    needs: macos-arm64
+    runs-on: macos-15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tabby-et-ssh-support-macos-arm64-run-${{ github.run_id }}
+      - name: Verify downloaded DMG and launch copied app
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="$(find . -maxdepth 3 -name '*.dmg' -print -quit)"
+          test -n "$dmg"
+          hdiutil verify "$dmg"
+          mount_dir="$(mktemp -d)"
+          copy_dir="$(mktemp -d)"
+          trap 'hdiutil detach "$mount_dir" || true; rm -rf "$mount_dir" "$copy_dir"' EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_dir" "$dmg"
+          codesign --verify --deep --strict --verbose=2 "$mount_dir/Tabby.app"
+          ditto "$mount_dir/Tabby.app" "$copy_dir/Tabby.app"
+          codesign --verify --deep --strict --verbose=2 "$copy_dir/Tabby.app"
+          xattr -w com.apple.quarantine '0081;00000000;GitHub Actions;preview' "$copy_dir/Tabby.app"
+          xattr -dr com.apple.quarantine "$copy_dir/Tabby.app"
+          open -n "$copy_dir/Tabby.app"
+          sleep 5
+          ps -axo pid,command | grep '[T]abby.app/Contents/MacOS/Tabby'
